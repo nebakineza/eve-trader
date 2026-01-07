@@ -31,6 +31,7 @@ async def main():
     analyst = AFF_V2(redis_client=bridge.redis_client)
 
     logger.info("Librarian Service Started.")
+    logger.info("Signal Shield Active (orders): window=24h z>3.0 -> drop per-type tick")
 
     last_history_fetch = datetime.min
     
@@ -67,6 +68,14 @@ async def main():
                 
                 # Validator/Cleaner
                 clean_batch = scraper.validator_cleaner(batch, data_type="orders")
+
+                # Signal Shield: drop manipulated per-type ticks (24h rolling z-score on mid)
+                clean_batch = scraper.signal_shield_filter_orders(
+                    clean_batch,
+                    redis_client=bridge.redis_client,
+                    window_hours=24,
+                    z_threshold=3.0,
+                )
                 
                 # Push Batch to DB immediately
                 await bridge.push_to_postgres("market_orders", clean_batch)

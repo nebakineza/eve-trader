@@ -14,6 +14,7 @@ from storage.bridge import DataBridge
 from strategist.agent import StrategistRLAgent
 from strategist.logic import update_market_radar
 from scripts.notifier import send_alert
+from strategist.shadow_manager import ShadowManager
 
 async def main():
     logging.basicConfig(level=logging.INFO)
@@ -21,6 +22,21 @@ async def main():
     
     db_url = os.getenv("DATABASE_URL", "postgresql://eve_user:eve_password@localhost:5432/eve_market_data")
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+    def _redact_db_url(url: str) -> str:
+        try:
+            if "://" not in url or "@" not in url:
+                return url
+            scheme, rest = url.split("://", 1)
+            creds, hostpart = rest.split("@", 1)
+            if ":" in creds:
+                user, _pwd = creds.split(":", 1)
+                creds = f"{user}:***"
+            return f"{scheme}://{creds}@{hostpart}"
+        except Exception:
+            return "<redacted>"
+
+    logger.info(f"DB URL: {_redact_db_url(db_url)}")
     
     # DB Engine for Direct Queries
     db_engine = sqlalchemy.create_engine(db_url.replace("asyncpg", "psycopg2")) if "postgresql" in db_url else None
@@ -28,14 +44,31 @@ async def main():
     # Wait for DB/Redis capabilities
     bridge = DataBridge(db_url, redis_url)
     agent = StrategistRLAgent(system_mode=os.getenv("SYSTEM_MODE", "SHADOW"), db_bridge=bridge)
+
+    shadow = None
+    if db_url and "postgresql" in db_url:
+        try:
+            shadow = ShadowManager(db_url)
+            shadow.ensure_schema()
+        except Exception as e:
+            logger.exception("Shadow ledger unavailable")
     
     # Dynamic Watchlist (User Request: Full 500)
     # WATCHLIST = [34, 35, 36, 37, 38, 39, 40, 29668, 44992] 
 
+    logger.info(f"Listening for Oracle Signals (SYSTEM_MODE={os.getenv('SYSTEM_MODE', 'SHADOW')})")
     logger.info("Strategist Main Loop Started (Rate: 5 mins)")
 
     while True:
         try:
+            if shadow is not None:
+                try:
+                    settled = shadow.settle_pending_trades()
+                    if settled:
+                        logger.info(f"Shadow ledger: settled {settled} pending trades")
+                except Exception as e:
+                    logger.warning(f"Shadow settlement error: {e}")
+
             logger.info("🔍 Scanning Market Opportunities...")
             
             # Fetch ALL active items from Redis keys
@@ -87,76 +120,85 @@ async def main():
                     continue
                     
                 current_price = features.get('price', 0.0)
-                    
                 # Prepare Payload for Oracle
-                    # (Mocking dimensions to match Oracle's expectation if simple)
-                    # Real features would serve just the raw dict if Oracle handles it.
-                    
-                    # 2. Call Oracle
-                    host = os.getenv("ORACLE_HOST", "http://oracle:8000")
-                    oracle_response = None
-                    
+                # (Mocking dimensions to match Oracle's expectation if simple)
+                # Real features would serve just the raw dict if Oracle handles it.
+
+                # 2. Call Oracle
+                host = os.getenv("ORACLE_HOST", "http://oracle:8000")
+                oracle_response = None
+
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(f"{host}/predict", json={"features": features}) as resp:
+                            if resp.status == 200:
+                                oracle_response = await resp.json()
+                except Exception as e:
+                    logger.warning(f"Oracle offline for {type_id}: {e}")
+
+                # Fallback / Mock if Oracle not ready yet (during bootstrap)
+                if not oracle_response:
+                    continue
+
+                # 3. Analyze Prediction
+                predicted_price = oracle_response.get("predicted_price", current_price)
+                confidence = oracle_response.get("confidence", 0.0)
+
+                if shadow is not None:
                     try:
-                        async with aiohttp.ClientSession() as session:
-                             async with session.post(f"{host}/predict", json={"features": features}) as resp:
-                                if resp.status == 200:
-                                    oracle_response = await resp.json()
+                        shadow.maybe_record_intended_trade(
+                            type_id=type_id,
+                            predicted_price=float(predicted_price) if predicted_price is not None else None,
+                            current_price=float(current_price) if current_price is not None else None,
+                            confidence=float(confidence) if confidence is not None else 0.0,
+                        )
                     except Exception as e:
-                        logger.warning(f"Oracle offline for {type_id}: {e}")
+                        logger.warning(f"Shadow record error for {type_id}: {e}")
 
-                    # Fallback / Mock if Oracle not ready yet (during bootstrap)
-                    if not oracle_response:
-                        continue
+                # Calculate Projected Profit (Unit Profit * Volume assumed or Lot Size)
+                # For filtering, let's assume a standard lot of 1,000 units for cheap items, 1 for expensive?
+                # Using a simplified 'Potenial' metric: (Predicted - Current) * 10000 units
+                potential_unit_profit = predicted_price - current_price
+                # Standard batch for calculation
+                batch_size = 10000
+                predicted_profit = potential_unit_profit * batch_size
 
-                    # 3. Analyze Prediction
-                    predicted_price = oracle_response.get("predicted_price", current_price)
-                    confidence = oracle_response.get("confidence", 0.0)
-                    
-                    # Calculate Projected Profit (Unit Profit * Volume assumed or Lot Size)
-                    # For filtering, let's assume a standard lot of 1,000 units for cheap items, 1 for expensive?
-                    # Using a simplified 'Potenial' metric: (Predicted - Current) * 10000 units
-                    potential_unit_profit = predicted_price - current_price
-                    # Standard batch for calculation
-                    batch_size = 10000 
-                    predicted_profit = potential_unit_profit * batch_size
-                    
-                    # 4. Trigger Signals
-                    signal_strength = confidence
-                    status = "WATCH"
-                    
-                    # --- CACHE REFRESH FIX ---
-                    # Explicitly update status in Redis to avoid stale keys
-                    status_key = f"market_radar:{type_id}"
-                    bridge.redis_client.set(status_key, json.dumps({
-                        "type_id": type_id,
-                        "status": "WATCH", # Reset to WATCH in loop to re-evaluate
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "price": current_price,
-                        "predicted": predicted_price,
-                        "confidence": confidence
-                    }), ex=300) # 5 min expiry matches loop
+                # 4. Trigger Signals
+                signal_strength = confidence
+                status = "WATCH"
 
-                    
-                    # STRONG BUY Condition
-                    if confidence > 0.6 and predicted_profit > 50_000_000:
-                        status = "ENTER"
-                        logger.info(f"🚀 STRONG BUY SIGNAL: {type_id} | Conf: {confidence:.2f}")
-                        
-                        # Send Alert
-                        # Item Name map (Mock)
-                        item_names = {34: "Tritanium", 35: "Pyerite", 36: "Mexallon", 37: "Isogen", 38: "Nocxium", 39: "Zydrine", 40: "Megacyte"}
-                        name = item_names.get(type_id, f"TypeID {type_id}")
-                        
-                        send_alert(name, predicted_price, confidence, predicted_profit)
+                # --- CACHE REFRESH FIX ---
+                # Explicitly update status in Redis to avoid stale keys
+                status_key = f"market_radar:{type_id}"
+                bridge.redis_client.set(status_key, json.dumps({
+                    "type_id": type_id,
+                    "status": "WATCH", # Reset to WATCH in loop to re-evaluate
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "price": current_price,
+                    "predicted": predicted_price,
+                    "confidence": confidence
+                }), ex=300) # 5 min expiry matches loop
 
-                    # 5. Persist to Market Radar
-                    # Need a connection pool. DataBridge has one or we create one?
-                    # DataBridge uses asyncpg but we need to access the pool.
-                    # Assuming bridge.db_pool is accessible or we use a fresh connection.
-                    # For now, let's assume bridge handles it or we instantiate a pool here if needed.
-                    # To keep it simple, we'll access the private _pool if available or create one.
-                    if hasattr(bridge, 'pool'):
-                        await update_market_radar(bridge.pool, type_id, signal_strength, predicted_price, current_price, status)
+                # STRONG BUY Condition
+                if confidence > 0.6 and predicted_profit > 50_000_000:
+                    status = "ENTER"
+                    logger.info(f"🚀 STRONG BUY SIGNAL: {type_id} | Conf: {confidence:.2f}")
+
+                    # Send Alert
+                    # Item Name map (Mock)
+                    item_names = {34: "Tritanium", 35: "Pyerite", 36: "Mexallon", 37: "Isogen", 38: "Nocxium", 39: "Zydrine", 40: "Megacyte"}
+                    name = item_names.get(type_id, f"TypeID {type_id}")
+
+                    send_alert(name, predicted_price, confidence, predicted_profit)
+
+                # 5. Persist to Market Radar
+                # Need a connection pool. DataBridge has one or we create one?
+                # DataBridge uses asyncpg but we need to access the pool.
+                # Assuming bridge.db_pool is accessible or we use a fresh connection.
+                # For now, let's assume bridge handles it or we instantiate a pool here if needed.
+                # To keep it simple, we'll access the private _pool if available or create one.
+                if hasattr(bridge, 'pool'):
+                    await update_market_radar(bridge.pool, type_id, signal_strength, predicted_price, current_price, status)
                 
         except Exception as e:
             logger.error(f"Strategist Loop Error: {e}")

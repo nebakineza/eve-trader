@@ -109,8 +109,13 @@ class OracleTemporalTransformer(nn.Module):
         # We process this check even though we return gradients for training.
         # In inference mode, this string flag is consumed by the Strategist.
         status_flag = "OK"
-        if confidence.item() < 0.40:
-            status_flag = "INSUFFICIENT_DATA"
+        try:
+            # confidence is shape (batch, 1) during training; use mean as a stable scalar.
+            conf_scalar = float(confidence.detach().mean().item())
+            if conf_scalar < 0.40:
+                status_flag = "INSUFFICIENT_DATA"
+        except Exception:
+            pass
 
         return {
             "predicted_price": predicted_price,

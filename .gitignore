@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual env
+.venv/
+venv/
+ENV/
+
+# OS/editor
+.DS_Store
+.vscode/
+
+# Local data / state
+pgdata/
+data/
+
+# Training artifacts
+models/
+training_data*.parquet
+
+# Logs
+*.log

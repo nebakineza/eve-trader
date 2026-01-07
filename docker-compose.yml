@@ -9,16 +9,21 @@ services:
     image: timescale/timescaledb:latest-pg14
     container_name: eve-trader-db
     environment:
-      - POSTGRES_PASSWORD=afterburn118921
+      - POSTGRES_PASSWORD=eve_pass
       - POSTGRES_USER=eve_user
       - POSTGRES_DB=eve_market_data
     ports:
       - "5432:5432"
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - ./pgdata:/var/lib/postgresql/data
     networks:
       - eve_net
     restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   cache:
     image: redis:alpine
@@ -30,6 +35,11 @@ services:
     networks:
       - eve_net
     restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   librarian:
     build: .
@@ -39,39 +49,159 @@ services:
       - db
       - cache
     environment:
-      - DATABASE_URL=postgresql://eve_user:afterburn118921@db:5432/eve_market_data
-      - REDIS_HOST=cache
+      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - REDIS_URL=redis://cache:6379/0
+    volumes:
+      - .:/app
     networks:
       - eve_net
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   nexus-dashboard:
     build: .
     container_name: eve-trader-nexus-dashboard
-    command: streamlit run nexus/dashboard.py --server.port 8501 --server.address 0.0.0.0
+    command: streamlit run nexus/command_center.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
     depends_on:
       - db
       - cache
     environment:
-      - DATABASE_URL=postgresql://eve_user:afterburn118921@db:5432/eve_market_data
-      - REDIS_HOST=cache
+      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - REDIS_URL=redis://cache:6379/0
     volumes:
       - ./:/app
     networks:
       - eve_net
     restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   strategist:
     build: .
     container_name: eve-trader-strategist
-    command: python -m strategist.core
+    command: python -m strategist.main
     depends_on:
       - db
       - cache
     environment:
-      - DATABASE_URL=postgresql://eve_user:afterburn118921@db:5432/eve_market_data
-      - REDIS_HOST=cache
+      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - REDIS_URL=redis://cache:6379/0
+      - SYSTEM_MODE=SHADOW
     networks:
       - eve_net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  arduino-bridge:
+    build: .
+    container_name: eve-trader-arduino-bridge
+    command: python scripts/arduino_bridge.py
+    depends_on:
+      - cache
+    environment:
+      - REDIS_URL=redis://cache:6379/0
+      - ARDUINO_PORT=/dev/ttyACM0
+      - ARDUINO_BAUD=9600
+      - RETRY_SECONDS=5
+    networks:
+      - eve_net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  watchdog:
+    build: .
+    container_name: eve-trader-watchdog
+    command: python scripts/db_watchdog.py
+    depends_on:
+      - db
+      - cache
+    environment:
+      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - REDIS_URL=redis://cache:6379/0
+    volumes:
+      - ./:/app
+    networks:
+      - eve_net
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  data-exporter:
+    build: .
+    container_name: eve-trader-data-exporter
+    command: uvicorn scripts.export_api:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./:/app
+    networks:
+      - eve_net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  historian:
+    build: .
+    container_name: eve-trader-historian
+    command: python scripts/market_historian.py --loop --region-id 10000002 --bucket-minutes 5 --lookback-minutes 5
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+    volumes:
+      - ./:/app
+    networks:
+      - eve_net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  daily-alpha:
+    build: .
+    container_name: eve-trader-daily-alpha
+    command: python scripts/daily_alpha.py --loop --interval-seconds 86400
+    depends_on:
+      - db
+      - cache
+    environment:
+      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - REDIS_URL=redis://cache:6379/0
+      - DAILY_ALPHA_REDIS_KEY=performance:last24h
+      - DAILY_ALPHA_HORIZON_MINUTES=60
+      - DAILY_ALPHA_FEE_RATE=0.025
+    volumes:
+      - ./:/app
+    networks:
+      - eve_net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
