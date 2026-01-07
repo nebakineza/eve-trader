@@ -1,0 +1,77 @@
+version: '3.8'
+
+networks:
+  eve_net:
+    driver: bridge
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg14
+    container_name: eve-trader-db
+    environment:
+      - POSTGRES_PASSWORD=afterburn118921
+      - POSTGRES_USER=eve_user
+      - POSTGRES_DB=eve_market_data
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    networks:
+      - eve_net
+    restart: always
+
+  cache:
+    image: redis:alpine
+    container_name: eve-trader-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - eve_net
+    restart: always
+
+  librarian:
+    build: .
+    container_name: eve-trader-librarian
+    command: python -m librarian.main_v2
+    depends_on:
+      - db
+      - cache
+    environment:
+      - DATABASE_URL=postgresql://eve_user:afterburn118921@db:5432/eve_market_data
+      - REDIS_HOST=cache
+    networks:
+      - eve_net
+    restart: unless-stopped
+
+  nexus-dashboard:
+    build: .
+    container_name: eve-trader-nexus-dashboard
+    command: streamlit run nexus/dashboard.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    depends_on:
+      - db
+      - cache
+    environment:
+      - DATABASE_URL=postgresql://eve_user:afterburn118921@db:5432/eve_market_data
+      - REDIS_HOST=cache
+    volumes:
+      - ./:/app
+    networks:
+      - eve_net
+    restart: always
+
+  strategist:
+    build: .
+    container_name: eve-trader-strategist
+    command: python -m strategist.core
+    depends_on:
+      - db
+      - cache
+    environment:
+      - DATABASE_URL=postgresql://eve_user:afterburn118921@db:5432/eve_market_data
+      - REDIS_HOST=cache
+    networks:
+      - eve_net
