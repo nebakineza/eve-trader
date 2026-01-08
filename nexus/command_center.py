@@ -571,8 +571,7 @@ with tab_fundamentals:
         "Insight: Jita player count + ISK destroyed shift the demand curve right — this is the macro \"Surge\" driver the 5090 Oracle hunts."
     )
 
-    # Faster refresh for desk-style alerting.
-    st_autorefresh(interval=int(os.getenv("FUNDAMENTALS_REFRESH_MS", "2000")), key="fundamentals_refresh")
+    # Fundamentals uses the global dashboard refresh (see datarefresh) to avoid UI stutter.
 
     # Real-time feed sourced from Redis.
     try:
