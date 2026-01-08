@@ -19,6 +19,7 @@ app = FastAPI(title="Oracle Inference Service")
 logger = logging.getLogger("OracleService")
 
 model: OracleTemporalTransformer | None = None
+MODEL_META: dict[str, Any] | None = None
 DEVICE = torch.device("cpu")
 REQUESTED_DEVICE = os.getenv("ORACLE_DEVICE", "cpu")
 
@@ -150,7 +151,7 @@ def _normalize_payload(
 
 @app.on_event("startup")
 async def load_model():
-    global model, DEVICE
+    global model, DEVICE, MODEL_META
     try:
         device_str = _select_device(REQUESTED_DEVICE)
         DEVICE = torch.device(device_str)
@@ -160,6 +161,8 @@ async def load_model():
         checkpoint_meta = None
         if os.path.exists(model_path):
             state_dict, checkpoint_meta = _load_checkpoint(model_path, map_location="cpu")
+            if isinstance(checkpoint_meta, dict):
+                MODEL_META = checkpoint_meta
             input_dim = 7
             if isinstance(checkpoint_meta, dict):
                 try:
@@ -191,6 +194,7 @@ async def health():
         "model_exists": os.path.exists(mp),
         "requested_device": REQUESTED_DEVICE,
         "cuda_available": bool(getattr(torch, "cuda", None) and torch.cuda.is_available()),
+        "model_target": (MODEL_META or {}).get("target") if isinstance(MODEL_META, dict) else None,
     }
 
 class MarketFeatures(BaseModel):
@@ -224,13 +228,24 @@ async def predict(data: MarketFeatures):
         conf_tensor = output.get("confidence")
         status = output.get("status", "OK")
 
-        pred_price = float(pred_tensor[0][0].item()) if pred_tensor is not None else 0.0
+        pred_raw = float(pred_tensor[0][0].item()) if pred_tensor is not None else 0.0
         confidence = float(conf_tensor[0][0].item()) if conf_tensor is not None else 0.0
 
-        # Fallback if Prediction is unusable
-        if pred_price <= 0.0:
+        # Decode model output based on checkpoint metadata.
+        # - target=return: output is a relative return over horizon; convert to absolute price using current price
+        # - otherwise: treat output as absolute price
+        target = (MODEL_META or {}).get("target") if isinstance(MODEL_META, dict) else None
+        pred_price = pred_raw
+        if target == "return":
+            current = 0.0
             if isinstance(data.features, dict):
-                pred_price = _as_float(data.features.get("price"), 0.0)
+                current = _as_float(data.features.get("price"), 0.0)
+            if current and current > 0:
+                pred_price = float(current * (1.0 + pred_raw))
+
+        # Fallback if unusable
+        if pred_price <= 0.0 and isinstance(data.features, dict):
+            pred_price = _as_float(data.features.get("price"), 0.0)
 
         return {
             "predicted_price": pred_price,

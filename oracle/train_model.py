@@ -296,7 +296,15 @@ def _make_sequences(
             x_list.append(x)
             h_list.append(hours[start_idx : end_idx + 1])
             d_list.append(days[start_idx : end_idx + 1])
-            y_list.append(price[target_idx])
+            # Target: horizon return relative to the last price in the lookback window.
+            # This keeps the learning problem scale-stable and matches our relative-input feature set.
+            p0 = float(price[end_idx])
+            p1 = float(price[target_idx])
+            if p0 > 0:
+                y = (p1 - p0) / p0
+            else:
+                y = 0.0
+            y_list.append(np.float32(y))
             t_list.append(pd.to_datetime(g["t"].iloc[target_idx]))
             total += 1
             if max_samples and total >= max_samples:
@@ -534,6 +542,7 @@ def train(cfg: TrainingConfig) -> str:
                 "created_at": ts,
                 "device": str(device),
                 "input_dim": 7,
+                "target": "return",
                 "lookback_minutes": cfg.lookback_minutes,
                 "horizon_minutes": cfg.horizon_minutes,
                 "bucket_minutes": cfg.bucket_minutes,
@@ -586,6 +595,7 @@ def train(cfg: TrainingConfig) -> str:
             "val_r2": float(val_r2),
             "accepted": bool(accepted),
             "reject_reason": reject_reason,
+            "target": "return",
         }
         r.set("oracle:last_training_metrics", json.dumps(metrics))
         r.set("oracle:model_latest_path", str(model_path))
