@@ -15,7 +15,7 @@ REDIS_PORT = 6379
 DB_HOST = os.getenv("DB_HOST", "db")
 DB_NAME = os.getenv("POSTGRES_DB", "eve_market_data")
 DB_USER = os.getenv("POSTGRES_USER", "eve_user")
-DB_PASS = os.getenv("POSTGRES_PASSWORD", "afterburn118921")
+DB_PASS = os.getenv("POSTGRES_PASSWORD", "eve_pass")
 
 def force_sync():
     logger.info("🚀 Starting Force Sync: Redis -> Postgres")

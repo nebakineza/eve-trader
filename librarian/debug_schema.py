@@ -1,7 +1,11 @@
 import asyncio
 import asyncpg
+import os
 
-DSN = "postgres://eve_user:afterburn118921@localhost:5432/eve_market_data"
+DSN = os.getenv(
+    "DATABASE_URL",
+    "postgresql://eve_user:eve_pass@localhost:5432/eve_market_data",
+)
 
 async def check_schema():
     try:

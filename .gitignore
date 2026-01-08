@@ -1,3 +1,10 @@
+.venv-blackwell/
+.venv-oracle/
+oracle_v1.pth
+*.pt
+zombie_root.png
+*.png
+*.log
 # Python
 __pycache__/
 *.py[cod]

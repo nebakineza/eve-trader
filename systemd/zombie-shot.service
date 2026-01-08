@@ -1,0 +1,12 @@
+[Unit]
+Description=EVE Trader ZombieShot (publish DISPLAY=:1 screenshot to Redis)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=seb
+WorkingDirectory=/home/seb/eve-trader
+Environment=DISPLAY=:1
+ExecStart=/usr/bin/python3 /home/seb/eve-trader/scripts/zombie_shot.py --redis-url redis://127.0.0.1:6379/0
+

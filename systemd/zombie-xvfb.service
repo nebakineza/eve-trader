@@ -1,0 +1,14 @@
+[Unit]
+Description=EVE Trader Zombie Xvfb (:0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=seb
+ExecStart=/usr/bin/Xvfb :0 -screen 0 1280x720x24 -nolisten tcp -ac
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

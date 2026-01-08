@@ -9,7 +9,7 @@ DB_HOST = os.getenv("DB_HOST", "192.168.14.105") # Accessing Body from Brain
 DB_PORT = 5432
 DB_NAME = "eve_market_data"
 DB_USER = "eve_user"
-DB_PASS = os.getenv("POSTGRES_PASSWORD", "afterburn118921") # Use verified pass
+DB_PASS = os.getenv("POSTGRES_PASSWORD", "eve_pass")
 OUTPUT_FILE = "training_data_24h.parquet"
 
 logging.basicConfig(level=logging.INFO)

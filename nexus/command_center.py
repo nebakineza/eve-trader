@@ -9,6 +9,7 @@ import sys
 import os
 import requests
 import math
+import re
 from datetime import datetime, timedelta
 import sqlalchemy
 from sqlalchemy import text
@@ -58,6 +59,127 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st_autorefresh(interval=30 * 1000, key="datarefresh")
+
+# --- Local/Remote Log Helpers ---
+def _tail_text_file(path: str, lines: int = 3, max_bytes: int = 64 * 1024) -> str:
+    """Read the last N lines of a text file without loading it all."""
+    try:
+        if not path or not os.path.exists(path):
+            return ""
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            read_size = min(max_bytes, size)
+            f.seek(-read_size, os.SEEK_END)
+            data = f.read(read_size)
+        text = data.decode("utf-8", errors="replace")
+        parts = text.splitlines()
+        return "\n".join(parts[-lines:])
+    except Exception:
+        return ""
+
+
+def read_eve_client_rsync_tail(lines: int = 3) -> str:
+    """Best-effort: local log path, else optional SSH tail."""
+    log_path = os.getenv("EVE_CLIENT_RSYNC_LOG_PATH", "/tmp/eve_client_rsync.log")
+    tail = _tail_text_file(log_path, lines=lines)
+    if tail:
+        return tail
+
+    # Optional: allow pulling from a remote host if the dashboard isn't running on Skynet.
+    # Example: export EVE_CLIENT_RSYNC_LOG_SSH='seb@SKYNET'
+    ssh_host = os.getenv("EVE_CLIENT_RSYNC_LOG_SSH", "").strip()
+    if not ssh_host:
+        return ""
+
+    try:
+        import subprocess
+
+        cmd = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=3",
+            ssh_host,
+            f"tail -n {int(lines)} {log_path} 2>/dev/null || true",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        return (res.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def parse_rsync_progress_from_tail(tail: str):
+    """Parse rsync --info=progress2 lines to (percent, speed, eta)."""
+    if not tail:
+        return None
+    last = ""
+    for line in tail.splitlines()[::-1]:
+        if "%" in line and "(" in line:
+            last = line.strip()
+            break
+    if not last:
+        return None
+
+    # Example:
+    # 100,629,169   2%   39.09MB/s    0:00:02 (xfr#342, ir-chk=1314/11517)
+    m = re.search(
+        r"\s(?P<pct>\d{1,3})%\s+(?P<speed>\S+)\s+(?P<eta>\d+:\d\d:\d\d|\d+:\d\d)\s+\(",
+        last,
+    )
+    if not m:
+        return None
+    try:
+        pct = max(0, min(100, int(m.group("pct"))))
+    except Exception:
+        pct = None
+    return {
+        "percent": pct,
+        "speed": m.group("speed"),
+        "eta": m.group("eta"),
+        "raw": last,
+    }
+
+
+def render_eve_client_sync_status():
+    tail = read_eve_client_rsync_tail(lines=3)
+    info = parse_rsync_progress_from_tail(tail)
+
+    if not tail:
+        st.info("📂 Status: Awaiting Client Upload to `~/eve-client`.")
+        st.markdown("📦 Syncing EVE Client: *(no rsync log visible)*")
+        return
+
+    if not info or info.get("percent") is None:
+        st.info("📂 Status: Awaiting Client Upload to `~/eve-client`.")
+        st.markdown("📦 Syncing EVE Client: *(parsing pending)*")
+        st.code(tail)
+        return
+
+    percent = int(info["percent"])
+    if percent >= 100:
+        st.success("✅ Client Data Verified: Ready for Zombie Boot.")
+
+        if not st.session_state.get("client_sync_ready_notified", False):
+            try:
+                st.toast("✅ Client Data Verified: Ready for Zombie Boot.")
+            except Exception:
+                pass
+            st.session_state["client_sync_ready_notified"] = True
+    else:
+        st.info("📂 Status: Awaiting Client Upload to `~/eve-client`.")
+
+    blocks = 10
+    filled = max(0, min(blocks, int(round((percent / 100) * blocks))))
+    bar = ("█" * filled) + ("░" * (blocks - filled))
+
+    st.markdown(f"📦 Syncing EVE Client: [{bar}] {percent}% (ETA: {info['eta']})")
+    try:
+        st.progress(percent / 100)
+    except Exception:
+        pass
+    st.caption(f"Speed: {info['speed']}")
 
 # --- Redis Connection ---
 @st.cache_resource
@@ -421,10 +543,11 @@ with tab_performance:
                 updated_at = str(alpha.get("updated_at", ""))
 
                 st.subheader("Last 24h Performance")
+                st.metric("Geometric Mean Return (Last 24h)", f"{gmean*100:.3f}%")
                 c_a, c_b, c_c = st.columns(3)
-                c_a.metric("Geometric Mean Return", f"{gmean*100:.3f}%")
-                c_b.metric("Max Drawdown", f"{mdd*100:.3f}%")
-                c_c.metric("Resolved Trades", f"{n}")
+                c_a.metric("Max Drawdown", f"{mdd*100:.3f}%")
+                c_b.metric("Resolved Trades", f"{n}")
+                c_c.metric("Projected 24h Yield", f"{gmean*100:.3f}%")
                 if updated_at:
                     st.caption(f"Updated: {updated_at}")
                 st.divider()
@@ -576,6 +699,21 @@ with tab_system:
         z_vram = "0/8GB"
         
         if r:
+            # Preferred: direct P4000 keys (gpu_logger)
+            try:
+                t = r.get("system:p4000:temp")
+                u = r.get("system:p4000:load")
+                m = r.get("system:p4000:vram")
+                if t is not None:
+                    z_gpu_temp = f"{t}°C"
+                if u is not None:
+                    z_gpu_load = f"{u}%"
+                if m is not None:
+                    z_vram = f"{m} MiB"
+            except Exception:
+                pass
+
+            # Back-compat: legacy JSON blob
             z_tele = r.get("zombie:telemetry")
             if z_tele:
                 try:
@@ -585,13 +723,111 @@ with tab_system:
                     z_vram = z_data.get("vram_usage", z_vram)
                 except: pass
         
+        # P4000 metrics (Zombie host)
         c1, c2, c3 = st.columns(3)
         c1.metric("P4000 Temp", z_gpu_temp)
-        c2.metric("GPU Load", z_gpu_load)
-        c3.metric("VRAM", z_vram)
+        c2.metric("P4000 Load", z_gpu_load)
+        c3.metric("P4000 VRAM", z_vram)
+
+        # SkyNet / 5090 metrics (training host)
+        s_temp = "N/A"
+        s_load = "0%"
+        s_vram = "0 MiB"
+        if r:
+            try:
+                t = r.get("system:skynet:temp")
+                u = r.get("system:skynet:load")
+                m = r.get("system:skynet:vram")
+                if t is not None:
+                    s_temp = f"{t}°C"
+                if u is not None:
+                    s_load = f"{u}%"
+                if m is not None:
+                    s_vram = f"{m} MiB"
+            except Exception:
+                pass
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("5090 Temp", s_temp)
+        c5.metric("5090 Load", s_load)
+        c6.metric("5090 VRAM", s_vram)
+
+        render_eve_client_sync_status()
         
-        st.markdown("**Real-Time Scrape Feed:**")
-        st.code("Waiting for Zombie Telemetry stream...")
+        st.markdown("**Visual Verification (Live Frame):**")
+
+        st.markdown("**📜 Accept EULA**")
+        if r:
+            c_eula1, c_eula2 = st.columns([1, 3])
+            with c_eula1:
+                do_eula = st.button("📜 Accept EULA", use_container_width=True)
+            with c_eula2:
+                st.caption("Triggers an aggressive host-side EULA bypass (blind-fire) and a standard prompt sweep.")
+
+            if do_eula:
+                try:
+                    # Short TTL so stale requests don't linger.
+                    r.setex("system:zombie:force_entry", 30, "force")
+                    r.setex("system:zombie:eula_accept", 30, "sweep")
+                    st.success("EULA bypass requested.")
+                except Exception as e:
+                    st.error(f"Failed to request clearance sweep: {e}")
+        else:
+            st.info("EULA clearance unavailable (Redis not connected).")
+
+        st.markdown("**🔐 OTP Entry**")
+        if r:
+            otp_code = st.text_input("One-time code", type="password", help="Paste the OTP from your authenticator.")
+            c_otp1, c_otp2 = st.columns([1, 3])
+            with c_otp1:
+                do_inject = st.button("Inject", use_container_width=True)
+            with c_otp2:
+                st.caption("Writes OTP to Redis for the host to inject into the client.")
+
+            if do_inject:
+                if not otp_code:
+                    st.warning("Enter an OTP code first.")
+                else:
+                    try:
+                        # Short TTL so stale OTPs don't linger.
+                        r.setex("system:zombie:otp", 120, otp_code)
+                        st.success("OTP queued for injection.")
+                    except Exception as e:
+                        st.error(f"Failed to queue OTP: {e}")
+        else:
+            st.info("OTP injection unavailable (Redis not connected).")
+
+        if r:
+            try:
+                shot_b64 = r.get("system:zombie:screenshot")
+            except Exception:
+                shot_b64 = None
+        else:
+            shot_b64 = None
+
+        if shot_b64:
+            try:
+                import base64
+
+                img_bytes = base64.b64decode(shot_b64)
+
+                # Fallback for older Streamlit versions
+                try:
+                    st.image(
+                        img_bytes,
+                        caption="EVE client frame (refreshes with page auto-refresh)",
+                        use_container_width=True,
+                    )
+                except TypeError:
+                    st.image(
+                        img_bytes,
+                        caption="EVE client frame (refreshes with page auto-refresh)",
+                        use_column_width=True,
+                    )
+            except Exception as e:
+                st.warning(f"Screenshot decode failed: {e}")
+        else:
+            st.info("No screenshot yet. Expect updates every ~60s once ZombieShot is running on the host.")
         
     with col_logs:
         st.subheader("Librarian Pulse & Watchdog")

@@ -10,7 +10,7 @@ import argparse
 DB_HOST = os.getenv("POSTGRES_HOST", "192.168.14.105")
 DB_PORT = os.getenv("POSTGRES_PORT", "5432")
 DB_USER = os.getenv("POSTGRES_USER", "eve_user")
-DB_PASS = os.getenv("POSTGRES_PASSWORD", "afterburn118921")
+DB_PASS = os.getenv("POSTGRES_PASSWORD", "eve_pass")
 DB_NAME = os.getenv("POSTGRES_DB", "eve_market_data")
 
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"

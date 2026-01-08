@@ -3,7 +3,10 @@ import asyncpg
 import os
 
 # Credentials from .env
-DSN = "postgres://eve_user:afterburn118921@localhost:5432/eve_market_data"
+DSN = os.getenv(
+    "DATABASE_URL",
+    "postgresql://eve_user:eve_pass@localhost:5432/eve_market_data",
+)
 
 async def init_db(dsn):
     print(f"Connecting to {dsn}...")
@@ -64,8 +67,5 @@ async def init_db(dsn):
         print(f"Error: {e}")
 
 if __name__ == "__main__":
-    # Ensure we use the correct DSN from env if available
-    final_dsn = os.getenv("DATABASE_URL", DSN)
-    print(f"Using DSN: {final_dsn}")
-
-    asyncio.run(init_db(final_dsn))
+    print(f"Using DSN: {DSN}")
+    asyncio.run(init_db(DSN))

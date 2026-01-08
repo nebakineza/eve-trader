@@ -96,6 +96,28 @@ services:
       - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
       - REDIS_URL=redis://cache:6379/0
       - SYSTEM_MODE=SHADOW
+      - ORACLE_HOST=http://192.168.14.105:8000
+      - SHADOW_CONFIDENCE_THRESHOLD=0.35
+    networks:
+      - eve_net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  oracle:
+    build: .
+    container_name: eve-trader-oracle
+    command: uvicorn oracle.main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      - cache
+    environment:
+      - ORACLE_DEVICE=cpu
+      - ORACLE_MODEL_PATH=/app/models/oracle_v1_latest.pt
+    volumes:
+      - ./:/app
     networks:
       - eve_net
     restart: unless-stopped
@@ -152,6 +174,8 @@ services:
     command: uvicorn scripts.export_api:app --host 0.0.0.0 --port 8001
     ports:
       - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
     volumes:
       - ./:/app
     networks:
@@ -200,6 +224,27 @@ services:
     networks:
       - eve_net
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  gpu-logger:
+    build: .
+    container_name: eve-trader-gpu-logger
+    command: python scripts/gpu_logger.py
+    depends_on:
+      - cache
+    environment:
+      - REDIS_URL=redis://cache:6379/0
+      - GPU_LOGGER_INTERVAL_SECONDS=30
+    volumes:
+      - ./:/app
+    networks:
+      - eve_net
+    restart: unless-stopped
+    gpus: all
     logging:
       driver: "json-file"
       options:

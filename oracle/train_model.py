@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import glob
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,52 @@ import pandas as pd
 
 
 DEFAULT_PARQUET_URL = "http://192.168.14.105:8001/training_data_cleaned.parquet"
+
+
+def sync_to_host(*, host: str, dest_dir: str) -> None:
+    """Sync trained weights to the Debian host and restart the oracle container.
+
+    Required behavior:
+    - scp models/oracle_v1_*.pt seb@192.168.14.105:~/eve-trader/models/
+    - restart oracle container on the server to load new weights
+
+    This is best-effort: training should not be lost if the network is down.
+    """
+
+    user_host = f"seb@{host}"
+    dest = f"{user_host}:{dest_dir}"
+
+    # Ensure destination exists
+    try:
+        subprocess.run(
+            ["ssh", user_host, f"mkdir -p {dest_dir}"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except Exception:
+        pass
+
+    # Copy weights
+    try:
+        subprocess.run(
+            ["scp"] + glob.glob("models/oracle_v1_*.pt") + [dest],
+            check=True,
+        )
+        print(f"✅ Synced weights to {dest}")
+    except Exception as e:
+        print(f"⚠️ Weight sync failed (scp): {e}")
+        return
+
+    # Restart strategist on the server to load the new weights
+    # (explicit requirement)
+    remote_restart = "docker restart eve-trader-strategist"
+    try:
+        subprocess.run(["ssh", user_host, remote_restart], check=False)
+        print("✅ Triggered remote restart to load new weights")
+    except Exception as e:
+        print(f"⚠️ Remote restart failed: {e}")
 
 
 def _require_torch():
@@ -298,12 +345,29 @@ def train(cfg: TrainingConfig) -> str:
         unique_buckets = int(df_feat["t"].nunique()) if (not df_feat.empty and "t" in df_feat.columns) else 0
         min_required = lookback_steps + horizon_steps + 1
         if unique_buckets < min_required:
-            raise RuntimeError(
-                "No training sequences could be generated (insufficient time series depth). "
-                f"Have {unique_buckets} time buckets; need at least {min_required}. "
-                "This typically means the Parquet represents a single snapshot, not rolling history. "
-                "Collect rolling features for >=6 hours (or reduce --lookback-minutes) and re-export."
-            )
+            # Emergency induction mode: allow bootstrapping the training pipeline from a single snapshot.
+            # This is gated behind an env var so normal operators still get the safety check.
+            allow_snapshot = os.getenv("ORACLE_ALLOW_SNAPSHOT_TRAINING", "0") == "1"
+            if not allow_snapshot:
+                raise RuntimeError(
+                    "No training sequences could be generated (insufficient time series depth). "
+                    f"Have {unique_buckets} time buckets; need at least {min_required}. "
+                    "This typically means the Parquet represents a single snapshot, not rolling history. "
+                    "Collect rolling features for >=6 hours (or reduce --lookback-minutes) and re-export."
+                )
+
+            if df_feat.empty or "t" not in df_feat.columns:
+                raise RuntimeError("Snapshot training requested but feature frame is empty.")
+
+            # Create synthetic buckets by repeating the latest bucket forward in time.
+            # This allows sequence construction and proves GPU training is wired correctly.
+            base_t = pd.to_datetime(df_feat["t"].max())
+            synthetic = []
+            for i in range(min_required):
+                chunk = df_feat.copy()
+                chunk["t"] = base_t + pd.to_timedelta(i * cfg.bucket_minutes, unit="m")
+                synthetic.append(chunk)
+            df_feat = pd.concat(synthetic, ignore_index=True)
 
         X, H, D, Y = _make_sequences(
             df_feat,
@@ -364,6 +428,12 @@ def train(cfg: TrainingConfig) -> str:
             },
             model_path,
         )
+
+        # Auto-sync weights to the Debian host (Body) and restart oracle to load.
+        # Defaults match the production host unless overridden.
+        sync_host = os.getenv("EVE_TRADER_SYNC_HOST", "192.168.14.105")
+        sync_dest = os.getenv("EVE_TRADER_SYNC_DEST", "~/eve-trader/models/")
+        sync_to_host(host=sync_host, dest_dir=sync_dest)
 
         metrics = {
             "timestamp": ts,

@@ -160,7 +160,8 @@ async def main():
                             valid_pulse = analyst.validate_market_integrity(features)
                             features["valid_pulse"] = valid_pulse
 
-                            bridge.push_to_redis(f"features:{type_id}", features, ttl=900)
+                            # Keep features alive across long snapshot ingestion; strategist relies on these keys.
+                            bridge.push_to_redis(f"features:{type_id}", features, ttl=3600)
                             count += 1
                         except Exception as ex:
                             logger.error(f"Feature Gen Error {type_id}: {ex}")

@@ -81,6 +81,26 @@ async def main():
                        WATCHLIST.append(int(k.split(':')[1]))
                    except: 
                        pass
+
+            # If Redis feature keys are absent (e.g., long ingestion window + TTL expiry),
+            # fall back to DB-derived watchlist so shadow trading can continue.
+            if not WATCHLIST and db_engine:
+                try:
+                    with db_engine.connect() as conn:
+                        rows = conn.execute(
+                            text(
+                                """
+                                SELECT DISTINCT type_id
+                                FROM market_orders
+                                WHERE type_id IS NOT NULL
+                                LIMIT 500
+                                """
+                            )
+                        ).fetchall()
+                    WATCHLIST = [int(r[0]) for r in rows if r and r[0] is not None]
+                    logger.info(f"Strategist watchlist fallback: {len(WATCHLIST)} type_ids from market_orders")
+                except Exception as e:
+                    logger.warning(f"Strategist watchlist fallback failed: {e}")
                        
             logger.info(f"Strategist targets found: {len(WATCHLIST)}")
 
@@ -113,6 +133,40 @@ async def main():
                                     features['price'] = result[0]
                     except Exception as e:
                         logger.warning(f"History fetch failed for {type_id}: {e}")
+
+                # If we still don't have a price, derive a basic quote from the current order book snapshot.
+                if db_engine and (not features or 'price' not in features):
+                    try:
+                        with db_engine.connect() as conn:
+                            row = conn.execute(
+                                text(
+                                    """
+                                    SELECT
+                                        MAX(price) FILTER (WHERE is_buy_order)  AS best_bid,
+                                        MIN(price) FILTER (WHERE NOT is_buy_order) AS best_ask,
+                                        SUM(volume_remaining) FILTER (WHERE is_buy_order) AS buy_vol,
+                                        SUM(volume_remaining) FILTER (WHERE NOT is_buy_order) AS sell_vol
+                                    FROM market_orders
+                                    WHERE type_id = :tid
+                                    """
+                                ),
+                                {"tid": type_id},
+                            ).fetchone()
+
+                        if row:
+                            best_bid, best_ask, buy_vol, sell_vol = row
+                            best_bid = float(best_bid) if best_bid is not None else 0.0
+                            best_ask = float(best_ask) if best_ask is not None else 0.0
+                            buy_vol = float(buy_vol) if buy_vol is not None else 0.0
+                            sell_vol = float(sell_vol) if sell_vol is not None else 0.0
+                            market_price = best_ask if best_ask > 0 else (best_bid if best_bid > 0 else 0.0)
+                            if market_price > 0:
+                                features.setdefault('best_bid', best_bid)
+                                features.setdefault('best_ask', best_ask)
+                                features.setdefault('price', market_price)
+                                features.setdefault('imbalance', (buy_vol + 1.0) / (sell_vol + 1.0))
+                    except Exception as e:
+                        logger.warning(f"Order-book fallback failed for {type_id}: {e}")
 
                 # Ensure we have minimum data for Oracle
                 if not features or 'price' not in features:
