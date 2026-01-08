@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
+from collections import defaultdict, deque
 
 # Add project root to path
 sys.path.append(os.getcwd())
@@ -10,6 +11,7 @@ sys.path.append(os.getcwd())
 from librarian.scraper import LibrarianESIScraper
 from storage.bridge import DataBridge
 from analyst.simple_feature import AnalystFeatureFactory as AFF_V2
+from oracle.indicators import latest_indicators_from_prices
 
 # Configuration
 REGION_ID = 10000002 # The Forge
@@ -33,6 +35,9 @@ async def main():
 
     last_history_fetch = datetime.min
     first_run = True
+
+    # Rolling indicator state (online). We intentionally keep this in-process to avoid DB fanout.
+    price_hist: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=256))
 
     while True:
         try:
@@ -156,6 +161,15 @@ async def main():
                                 "timestamp": now.timestamp(),
                                 "volume": current_vol
                             }
+
+                            # Online technical indicators (requires rolling price history)
+                            if market_price and market_price > 0:
+                                price_hist[int(type_id)].append(float(market_price))
+                                ind = latest_indicators_from_prices(price_hist[int(type_id)])
+                                # Only include when computed; warmup windows may be None.
+                                for k, v in ind.items():
+                                    if v is not None:
+                                        features[k] = float(v)
                             
                             valid_pulse = analyst.validate_market_integrity(features)
                             features["valid_pulse"] = valid_pulse

@@ -15,6 +15,28 @@ from strategist.agent import StrategistRLAgent
 from strategist.logic import update_market_radar
 from scripts.notifier import send_alert
 from strategist.shadow_manager import ShadowManager
+from strategist.shadow_manager import ShadowConfig
+
+
+def _read_shadow_threshold(*, bridge: DataBridge, fallback: float) -> float:
+    # Primary key per spec
+    keys = [
+        "system:shadow:confidence_threshold",
+        # Back-compat aliases (safe if operators already wrote a different key)
+        "system:shadow:threshold",
+        "system:shadow:confidence",
+    ]
+    for k in keys:
+        try:
+            v = bridge.redis_client.get(k)
+            if v is None:
+                continue
+            val = float(v)
+            if 0.0 <= val <= 1.0:
+                return val
+        except Exception:
+            continue
+    return float(fallback)
 
 async def main():
     logging.basicConfig(level=logging.INFO)
@@ -61,6 +83,22 @@ async def main():
 
     while True:
         try:
+            # Dynamic thresholding (Bayesian tuner can update Redis continuously)
+            if shadow is not None:
+                try:
+                    env_fallback = float(os.getenv("SHADOW_CONFIDENCE_THRESHOLD", "0.6"))
+                except Exception:
+                    env_fallback = 0.6
+
+                thr = _read_shadow_threshold(bridge=bridge, fallback=env_fallback)
+                if thr != shadow.config.confidence_threshold:
+                    shadow.config = ShadowConfig(
+                        horizon_minutes=shadow.config.horizon_minutes,
+                        confidence_threshold=float(thr),
+                        fee_rate=shadow.config.fee_rate,
+                    )
+                    logger.info(f"Shadow threshold updated from Redis: {thr:.3f}")
+
             if shadow is not None:
                 try:
                     settled = shadow.settle_pending_trades()

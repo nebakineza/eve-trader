@@ -36,7 +36,7 @@ def _select_device(requested: str) -> str:
 
 
 def _model_path() -> str:
-    return os.getenv("ORACLE_MODEL_PATH", "oracle_v1.pth")
+    return os.getenv("ORACLE_MODEL_PATH", "models/oracle_v1_latest.pt")
 
 
 def _load_checkpoint(path: str, *, map_location: str):
@@ -64,7 +64,24 @@ def _build_sequence_from_features(
         velocity = 0.0
 
     imbalance = _as_float(features.get("imbalance"), 1.0)
-    vec = [velocity, imbalance]
+
+    # Optional technical indicators (if the Librarian/stream provides them)
+    # Keep these transforms aligned with training normalization.
+    rsi_raw = _as_float(features.get("RSI"), 50.0)
+    rsi_scaled = (rsi_raw - 50.0) / 50.0
+
+    macd_raw = _as_float(features.get("MACD"), 0.0)
+    macd_sig_raw = _as_float(features.get("MACD_Signal"), 0.0)
+    bb_u_raw = _as_float(features.get("BB_Upper"), 0.0)
+    bb_l_raw = _as_float(features.get("BB_Low"), 0.0)
+
+    p_safe = price if price and price > 0 else 1.0
+    macd_rel = macd_raw / p_safe
+    macd_sig_rel = macd_sig_raw / p_safe
+    bb_u_rel = (bb_u_raw / p_safe) - 1.0
+    bb_l_rel = (bb_l_raw / p_safe) - 1.0
+
+    vec = [velocity, imbalance, rsi_scaled, macd_rel, macd_sig_rel, bb_u_rel, bb_l_rel]
 
     if input_dim > len(vec):
         vec = vec + [0.0] * (input_dim - len(vec))
@@ -143,7 +160,7 @@ async def load_model():
         checkpoint_meta = None
         if os.path.exists(model_path):
             state_dict, checkpoint_meta = _load_checkpoint(model_path, map_location="cpu")
-            input_dim = 10
+            input_dim = 7
             if isinstance(checkpoint_meta, dict):
                 try:
                     input_dim = int(checkpoint_meta.get("input_dim", input_dim))
@@ -155,7 +172,7 @@ async def load_model():
                 f"Loaded model weights from {model_path} (device={DEVICE}, input_dim={input_dim})"
             )
         else:
-            model = OracleTemporalTransformer(input_dim=10)
+            model = OracleTemporalTransformer(input_dim=7)
             logger.warning(f"No model weights found at {model_path}. Using initialized random weights (Untrained).")
 
         model.to(DEVICE)

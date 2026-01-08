@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 import numpy as np
 import pandas as pd
 
+from oracle.indicators import add_indicators
+
 
 DEFAULT_PARQUET_URL = "http://192.168.14.105:8001/training_data_cleaned.parquet"
 
@@ -168,6 +170,9 @@ def _build_time_series(df_orders: pd.DataFrame, bucket_minutes: int, max_types: 
     features["velocity"] = features.groupby("type_id")["market_price"].pct_change().replace([np.inf, -np.inf], np.nan)
     features["velocity"] = features["velocity"].fillna(0.0)
 
+    # Technical indicators (computed per type)
+    features = add_indicators(features, price_col="market_price", group_col="type_id", time_col="t")
+
     # Keep only meaningful prices
     features = features[features["market_price"] > 0]
     return features
@@ -220,8 +225,10 @@ def _build_time_series_from_history(df_history: pd.DataFrame, bucket_minutes: in
     out["velocity"] = out.groupby("type_id")["market_price"].pct_change().replace([np.inf, -np.inf], np.nan)
     out["velocity"] = out["velocity"].fillna(0.0)
 
+    out = add_indicators(out, price_col="market_price", group_col="type_id", time_col="t")
+
     out = out[out["market_price"] > 0]
-    return out[["t", "type_id", "market_price", "imbalance", "velocity"]]
+    return out[["t", "type_id", "market_price", "imbalance", "velocity", "RSI", "MACD", "MACD_Signal", "BB_Upper", "BB_Low"]]
 
 
 def _make_sequences(
@@ -235,6 +242,7 @@ def _make_sequences(
     h_list = []
     d_list = []
     y_list = []
+    t_list = []
 
     total = 0
     for _, g in df_feat.groupby("type_id"):
@@ -246,6 +254,13 @@ def _make_sequences(
         im = g["imbalance"].to_numpy(dtype=np.float32)
         price = g["market_price"].to_numpy(dtype=np.float32)
 
+        # Indicators (fill warmup NaNs to neutral defaults)
+        rsi14 = pd.to_numeric(g.get("RSI"), errors="coerce").fillna(50.0).to_numpy(dtype=np.float32)
+        macd_line = pd.to_numeric(g.get("MACD"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+        macd_sig = pd.to_numeric(g.get("MACD_Signal"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+        bb_u = pd.to_numeric(g.get("BB_Upper"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+        bb_l = pd.to_numeric(g.get("BB_Low"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+
         t = pd.to_datetime(g["t"]).dt
         hours = t.hour.to_numpy(dtype=np.int64)
         days = t.dayofweek.to_numpy(dtype=np.int64)
@@ -254,11 +269,35 @@ def _make_sequences(
             start_idx = end_idx - lookback_steps + 1
             target_idx = end_idx + horizon_steps
 
-            x = np.stack([v[start_idx : end_idx + 1], im[start_idx : end_idx + 1]], axis=1)
+            # Normalize scale-sensitive indicators so the model sees dimensionless inputs.
+            # - RSI: center around 50
+            # - MACD / bands: scale by price
+            p = price[start_idx : end_idx + 1]
+            p_safe = np.where(p > 0, p, 1.0)
+
+            rsi_scaled = (rsi14[start_idx : end_idx + 1] - 50.0) / 50.0
+            macd_rel = macd_line[start_idx : end_idx + 1] / p_safe
+            macd_sig_rel = macd_sig[start_idx : end_idx + 1] / p_safe
+            bb_u_rel = (bb_u[start_idx : end_idx + 1] / p_safe) - 1.0
+            bb_l_rel = (bb_l[start_idx : end_idx + 1] / p_safe) - 1.0
+
+            x = np.stack(
+                [
+                    v[start_idx : end_idx + 1],
+                    im[start_idx : end_idx + 1],
+                    rsi_scaled,
+                    macd_rel,
+                    macd_sig_rel,
+                    bb_u_rel,
+                    bb_l_rel,
+                ],
+                axis=1,
+            )
             x_list.append(x)
             h_list.append(hours[start_idx : end_idx + 1])
             d_list.append(days[start_idx : end_idx + 1])
             y_list.append(price[target_idx])
+            t_list.append(pd.to_datetime(g["t"].iloc[target_idx]))
             total += 1
             if max_samples and total >= max_samples:
                 break
@@ -273,7 +312,18 @@ def _make_sequences(
     H = np.asarray(h_list, dtype=np.int64)
     D = np.asarray(d_list, dtype=np.int64)
     Y = np.asarray(y_list, dtype=np.float32)
-    return X, H, D, Y
+    T = np.asarray(t_list, dtype="datetime64[ns]")
+    return X, H, D, Y, T
+
+
+def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = y_true.astype(np.float64)
+    y_pred = y_pred.astype(np.float64)
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - float(np.mean(y_true))) ** 2))
+    if ss_tot <= 0:
+        return 0.0
+    return 1.0 - (ss_res / ss_tot)
 
 
 def train(cfg: TrainingConfig) -> str:
@@ -369,22 +419,43 @@ def train(cfg: TrainingConfig) -> str:
                 synthetic.append(chunk)
             df_feat = pd.concat(synthetic, ignore_index=True)
 
-        X, H, D, Y = _make_sequences(
+        X, H, D, Y, T = _make_sequences(
             df_feat,
             lookback_steps=lookback_steps,
             horizon_steps=horizon_steps,
             max_samples=cfg.max_samples,
         )
 
+        # Walk-forward split: first 80% of buckets for train, last 20% for validation.
+        unique_ts = np.unique(T)
+        unique_ts = np.sort(unique_ts)
+        if unique_ts.size < 10:
+            raise RuntimeError(f"Not enough buckets for walk-forward validation: {int(unique_ts.size)}")
+
+        split_idx = int(np.floor(0.8 * unique_ts.size))
+        split_idx = max(1, min(split_idx, int(unique_ts.size - 1)))
+        cutoff = unique_ts[split_idx]
+
+        train_mask = T < cutoff
+        val_mask = ~train_mask
+
+        if int(np.sum(train_mask)) < 100 or int(np.sum(val_mask)) < 50:
+            raise RuntimeError(
+                f"Insufficient samples after split (train={int(np.sum(train_mask))}, val={int(np.sum(val_mask))})."
+            )
+
         X_t = torch.from_numpy(X)
         H_t = torch.from_numpy(H)
         D_t = torch.from_numpy(D)
         Y_t = torch.from_numpy(Y).unsqueeze(-1)
 
-        ds = TensorDataset(X_t, H_t, D_t, Y_t)
-        dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False)
+        train_ds = TensorDataset(X_t[train_mask], H_t[train_mask], D_t[train_mask], Y_t[train_mask])
+        val_ds = TensorDataset(X_t[val_mask], H_t[val_mask], D_t[val_mask], Y_t[val_mask])
 
-        model = OracleTemporalTransformer(input_dim=2, forecast_horizon=1).to(device)
+        train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False)
+        val_dl = DataLoader(val_ds, batch_size=max(64, int(cfg.batch_size)), shuffle=False, drop_last=False)
+
+        model = OracleTemporalTransformer(input_dim=7, forecast_horizon=1).to(device)
         model.train()
 
         optim = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
@@ -394,7 +465,7 @@ def train(cfg: TrainingConfig) -> str:
         for epoch in range(cfg.epochs):
             running = 0.0
             seen = 0
-            for xb, hb, db, yb in dl:
+            for xb, hb, db, yb in train_dl:
                 xb = xb.to(device)
                 hb = hb.to(device)
                 db = db.to(device)
@@ -414,6 +485,47 @@ def train(cfg: TrainingConfig) -> str:
             last_loss = running / max(1, seen)
             print(f"Epoch {epoch+1}/{cfg.epochs} | loss={last_loss:.6f}")
 
+        # Evaluate train/val performance (walk-forward)
+        model.eval()
+        with torch.no_grad():
+            def _predict(ds: TensorDataset) -> tuple[np.ndarray, np.ndarray]:
+                preds = []
+                trues = []
+                dl = DataLoader(ds, batch_size=2048, shuffle=False, drop_last=False)
+                for xb, hb, db, yb in dl:
+                    xb = xb.to(device)
+                    hb = hb.to(device)
+                    db = db.to(device)
+                    out = model(xb, hb, db)["predicted_price"].detach().cpu().numpy().reshape(-1)
+                    y = yb.detach().cpu().numpy().reshape(-1)
+                    preds.append(out)
+                    trues.append(y)
+                return np.concatenate(trues), np.concatenate(preds)
+
+            y_train, p_train = _predict(train_ds)
+            y_val, p_val = _predict(val_ds)
+
+        train_r2 = _r2(y_train, p_train)
+        val_r2 = _r2(y_val, p_val)
+
+        # Reject overfit models (defaults can be tuned via env)
+        min_val_r2 = float(os.getenv("ORACLE_MIN_VAL_R2", "0.2"))
+        max_gap = float(os.getenv("ORACLE_MAX_R2_GAP", "0.5"))
+        strict_train = float(os.getenv("ORACLE_STRICT_TRAIN_R2", "0.9"))
+        strict_val = float(os.getenv("ORACLE_STRICT_VAL_R2", "0.3"))
+
+        accepted = True
+        reject_reason = None
+        if val_r2 < min_val_r2:
+            accepted = False
+            reject_reason = f"val_r2_below_min (val_r2={val_r2:.3f} < {min_val_r2:.3f})"
+        elif (train_r2 - val_r2) > max_gap:
+            accepted = False
+            reject_reason = f"r2_gap_too_large (train_r2={train_r2:.3f}, val_r2={val_r2:.3f}, gap>{max_gap:.3f})"
+        elif train_r2 >= strict_train and val_r2 <= strict_val:
+            accepted = False
+            reject_reason = f"strict_overfit (train_r2={train_r2:.3f} >= {strict_train:.3f} and val_r2={val_r2:.3f} <= {strict_val:.3f})"
+
         cfg.model_dir.mkdir(parents=True, exist_ok=True)
         model_path = cfg.model_dir / f"oracle_v1_{ts}.pt"
         torch.save(
@@ -421,19 +533,38 @@ def train(cfg: TrainingConfig) -> str:
                 "state_dict": model.state_dict(),
                 "created_at": ts,
                 "device": str(device),
-                "input_dim": 2,
+                "input_dim": 7,
                 "lookback_minutes": cfg.lookback_minutes,
                 "horizon_minutes": cfg.horizon_minutes,
                 "bucket_minutes": cfg.bucket_minutes,
+                "walk_forward": {
+                    "cutoff_bucket": str(pd.to_datetime(cutoff)),
+                    "train_r2": float(train_r2),
+                    "val_r2": float(val_r2),
+                    "accepted": bool(accepted),
+                    "reject_reason": reject_reason,
+                    "min_val_r2": float(min_val_r2),
+                    "max_r2_gap": float(max_gap),
+                },
             },
             model_path,
         )
 
-        # Auto-sync weights to the Debian host (Body) and restart oracle to load.
-        # Defaults match the production host unless overridden.
-        sync_host = os.getenv("EVE_TRADER_SYNC_HOST", "192.168.14.105")
-        sync_dest = os.getenv("EVE_TRADER_SYNC_DEST", "~/eve-trader/models/")
-        sync_to_host(host=sync_host, dest_dir=sync_dest)
+        # Maintain a stable "latest" handle for continuous training.
+        latest_path = cfg.model_dir / "oracle_v1_latest.pt"
+        try:
+            tmp_latest = cfg.model_dir / f"oracle_v1_latest_{ts}.pt.tmp"
+            tmp_latest.write_bytes(model_path.read_bytes())
+            tmp_latest.replace(latest_path)
+        except Exception:
+            # Best-effort; the versioned model is the source of truth.
+            pass
+
+        # Only publish models that pass validation.
+        if accepted:
+            sync_host = os.getenv("EVE_TRADER_SYNC_HOST", "192.168.14.105")
+            sync_dest = os.getenv("EVE_TRADER_SYNC_DEST", "~/eve-trader/models/")
+            sync_to_host(host=sync_host, dest_dir=sync_dest)
 
         metrics = {
             "timestamp": ts,
@@ -442,18 +573,28 @@ def train(cfg: TrainingConfig) -> str:
             "gpu_name": gpu_name,
             "gpu_capability": gpu_capability,
             "gpu_warning": gpu_warning,
-            "samples": int(len(ds)),
+            "samples": int(len(train_ds) + len(val_ds)),
             "rows_in_parquet": int(len(df_orders)),
             "model_path": str(model_path),
             "lookback_minutes": cfg.lookback_minutes,
             "horizon_minutes": cfg.horizon_minutes,
             "bucket_minutes": cfg.bucket_minutes,
             "max_types": cfg.max_types,
+            "train_samples": int(len(train_ds)),
+            "val_samples": int(len(val_ds)),
+            "train_r2": float(train_r2),
+            "val_r2": float(val_r2),
+            "accepted": bool(accepted),
+            "reject_reason": reject_reason,
         }
         r.set("oracle:last_training_metrics", json.dumps(metrics))
         r.set("oracle:model_latest_path", str(model_path))
-        r.set("oracle:model_status", "LIVE" if cfg.set_live_after_train else "IDLE")
-        return str(model_path)
+        if accepted:
+            r.set("oracle:model_status", "LIVE" if cfg.set_live_after_train else "IDLE")
+            return str(model_path)
+
+        r.set("oracle:model_status", "REJECTED")
+        raise RuntimeError(f"Model rejected by validation: {reject_reason}")
     except Exception as e:
         err_metrics = {
             "timestamp": ts,
