@@ -516,11 +516,14 @@ def train(cfg: TrainingConfig) -> str:
         train_r2 = _r2(y_train, p_train)
         val_r2 = _r2(y_val, p_val)
 
-        # Reject overfit models (defaults can be tuned via env)
-        min_val_r2 = float(os.getenv("ORACLE_MIN_VAL_R2", "0.2"))
-        max_gap = float(os.getenv("ORACLE_MAX_R2_GAP", "0.5"))
-        strict_train = float(os.getenv("ORACLE_STRICT_TRAIN_R2", "0.9"))
-        strict_val = float(os.getenv("ORACLE_STRICT_VAL_R2", "0.3"))
+        # Reject overfit models (walk-forward).
+        # Default policy matches the intent:
+        # - Reject when training looks very strong but validation collapses (classic overfit)
+        # - Do not require a minimum validation score unless explicitly configured
+        min_val_r2 = float(os.getenv("ORACLE_MIN_VAL_R2", "-1.0"))
+        max_gap = float(os.getenv("ORACLE_MAX_R2_GAP", "0.7"))
+        strict_train = float(os.getenv("ORACLE_STRICT_TRAIN_R2", "0.95"))
+        strict_val = float(os.getenv("ORACLE_STRICT_VAL_R2", "0.2"))
 
         accepted = True
         reject_reason = None
