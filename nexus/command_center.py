@@ -58,7 +58,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st_autorefresh(interval=30 * 1000, key="datarefresh")
+st_autorefresh(interval=60 * 1000, key="datarefresh")
 
 # --- Local/Remote Log Helpers ---
 def _tail_text_file(path: str, lines: int = 3, max_bytes: int = 64 * 1024) -> str:
@@ -77,6 +77,36 @@ def _tail_text_file(path: str, lines: int = 3, max_bytes: int = 64 * 1024) -> st
         return "\n".join(parts[-lines:])
     except Exception:
         return ""
+
+
+def _read_macro_history(*, redis_client, key: str, max_points: int) -> pd.Series:
+    try:
+        if redis_client is None:
+            return pd.Series(dtype="float64")
+        raw = redis_client.lrange(key, -int(max_points), -1)
+        if not raw:
+            return pd.Series(dtype="float64")
+        ts = []
+        values = []
+        for item in raw:
+            try:
+                payload = json.loads(item)
+                t = float(payload.get("ts", 0) or 0)
+                v = payload.get("v", None)
+                if t <= 0 or v is None:
+                    continue
+                ts.append(datetime.utcfromtimestamp(t))
+                values.append(float(v))
+            except Exception:
+                continue
+        if not ts:
+            return pd.Series(dtype="float64")
+        s = pd.Series(values, index=pd.to_datetime(ts)).sort_index()
+        # Drop duplicate timestamps (keep last)
+        s = s[~s.index.duplicated(keep="last")]
+        return s
+    except Exception:
+        return pd.Series(dtype="float64")
 
 
 def read_eve_client_rsync_tail(lines: int = 3) -> str:
@@ -200,7 +230,7 @@ except Exception as e:
 # HARD-CODED CONNECTION - NO ENV VARS
 try:
     db_engine = sqlalchemy.create_engine('postgresql://eve_user:eve_pass@db:5432/eve_market_data')
-    @st.cache_data(ttl=30)
+    @st.cache_data(ttl=120)
     def get_market_orders_count():
         try:
             with db_engine.connect() as conn:
@@ -209,7 +239,7 @@ try:
         except:
             return 0
 
-    @st.cache_data(ttl=30)
+    @st.cache_data(ttl=120)
     def get_market_history_bucket_count(hours: int = 12):
         try:
             with db_engine.connect() as conn:
@@ -272,6 +302,14 @@ else:
 # --- Zombie & Bridge Status (Sidebar) ---
 st.sidebar.markdown("---")
 st.sidebar.header("Hardware Bridge")
+
+# Hardware Lock toggle (prevents Arduino bridge from sending serial commands until enabled)
+hardware_lock_state = st.sidebar.toggle("HARDWARE_LOCK", value=True, help="When enabled (locked), the Arduino bridge will NOT send serial commands. Disable to arm the hardware.")
+if r:
+    r.set("system:hardware_lock", "true" if hardware_lock_state else "false")
+    lock_msg = "🔒 LOCKED (safe)" if hardware_lock_state else "🔓 UNLOCKED (armed)"
+    st.sidebar.caption(lock_msg)
+
 try:
     zombie_status = r.get("zombie:hid_status") if r else "AMBER"
     if zombie_status == "GREEN":
@@ -337,8 +375,8 @@ if not pulse_items:
      pulse_items = [{"Item": "Waiting for Data...", "Current": 0.0, "Predicted": 0.0, "Conf": 0.0}]
 
 # --- TABS LAYOUT ---
-tab_radar, tab_execution, tab_oracle, tab_performance, tab_system = st.tabs(
-    ["Radar", "Execution", "Oracle", "📈 Performance Audit", "System"]
+tab_radar, tab_execution, tab_oracle, tab_fundamentals, tab_performance, tab_system = st.tabs(
+    ["Radar", "Execution", "Oracle", "📰 Fundamentals", "📈 Performance Audit", "System"]
 )
 
 # ========================
@@ -447,6 +485,55 @@ with tab_execution:
 with tab_oracle:
     st.markdown("### 🧠 Oracle Insight")
 
+    # Model Path & Validation R²
+    model_path_used = "models/oracle_v1_latest.pt"  # default for oracle container
+    if r:
+        try:
+            from_redis = r.get("oracle:model_path")
+            if from_redis:
+                model_path_used = str(from_redis)
+        except Exception:
+            pass
+
+    val_r2 = 0.0
+    train_r2 = 0.0
+    reject_reason = None
+    if r:
+        try:
+            metrics_raw = r.get("oracle:last_training_metrics")
+            if metrics_raw:
+                metrics = json.loads(metrics_raw)
+                val_r2 = float(metrics.get("val_r2", 0.0) or 0.0)
+                train_r2 = float(metrics.get("train_r2", 0.0) or 0.0)
+                reject_reason = metrics.get("reject_reason")
+        except Exception:
+            pass
+
+    # Next training session countdown (based on 4h cron schedule)
+    next_training_eta = "N/A"
+    if r:
+        try:
+            last_train_ts_raw = r.get("oracle:last_training_ts")
+            if last_train_ts_raw:
+                last_ts = float(last_train_ts_raw)
+                next_ts = last_ts + (4 * 3600)
+                remaining_s = max(0, next_ts - time.time())
+                h = int(remaining_s // 3600)
+                m = int((remaining_s % 3600) // 60)
+                next_training_eta = f"{h}h {m}m"
+        except Exception:
+            pass
+
+    c_m1, c_m2, c_m3 = st.columns(3)
+    c_m1.metric("Model Path", model_path_used.split("/")[-1])
+    c_m2.metric("Validation R²", f"{val_r2:.4f}")
+    c_m3.metric("Next Training", next_training_eta)
+
+    if reject_reason:
+        st.warning(f"🚫 Last Induction Rejected: {reject_reason}")
+
+    st.divider()
+
     # Sequence Readiness: count distinct 5-minute buckets in the last 12 hours.
     # We still target 85 buckets (~7 hours) for the Oracle attention lookback.
     target_buckets = 85
@@ -472,6 +559,188 @@ with tab_oracle:
     )
 
     st.divider()
+
+
+# ========================
+# TAB 4: FUNDAMENTALS (News Desk)
+# ========================
+with tab_fundamentals:
+    st.markdown("### 📰 Fundamentals")
+
+    st.info(
+        "Insight: Jita player count + ISK destroyed shift the demand curve right — this is the macro \"Surge\" driver the 5090 Oracle hunts."
+    )
+
+    # Faster refresh for desk-style alerting.
+    st_autorefresh(interval=int(os.getenv("FUNDAMENTALS_REFRESH_MS", "2000")), key="fundamentals_refresh")
+
+    # Real-time feed sourced from Redis.
+    try:
+        players_raw = r.get("system:macro:players")
+        warfare_raw = r.get("system:macro:warfare")
+        warfare_updated_at_raw = r.get("system:macro:warfare:updated_at")
+        warfare_source = r.get("system:macro:warfare:source")
+
+        jita_jumps_raw = r.get("system:macro:jita:ship_jumps")
+        jita_ship_kills_raw = r.get("system:macro:jita:ship_kills")
+        jita_pod_kills_raw = r.get("system:macro:jita:pod_kills")
+        jita_updated_at_raw = r.get("system:macro:jita:updated_at")
+    except Exception:
+        players_raw = None
+        warfare_raw = None
+        warfare_updated_at_raw = None
+        warfare_source = None
+
+        jita_jumps_raw = None
+        jita_ship_kills_raw = None
+        jita_pod_kills_raw = None
+        jita_updated_at_raw = None
+
+    try:
+        players_online = int(float(players_raw)) if players_raw is not None else 0
+    except Exception:
+        players_online = 0
+
+    try:
+        warfare_isk = float(warfare_raw) if warfare_raw is not None else 0.0
+    except Exception:
+        warfare_isk = 0.0
+
+    try:
+        jita_jumps = int(float(jita_jumps_raw)) if jita_jumps_raw is not None else 0
+    except Exception:
+        jita_jumps = 0
+    try:
+        jita_ship_kills = int(float(jita_ship_kills_raw)) if jita_ship_kills_raw is not None else 0
+    except Exception:
+        jita_ship_kills = 0
+    try:
+        jita_pod_kills = int(float(jita_pod_kills_raw)) if jita_pod_kills_raw is not None else 0
+    except Exception:
+        jita_pod_kills = 0
+
+    jita_age_s = None
+    try:
+        if jita_updated_at_raw is not None:
+            jita_age_s = max(0.0, time.time() - float(jita_updated_at_raw))
+    except Exception:
+        jita_age_s = None
+
+    warfare_age_s = None
+    try:
+        if warfare_updated_at_raw is not None:
+            warfare_age_s = max(0.0, time.time() - float(warfare_updated_at_raw))
+    except Exception:
+        warfare_age_s = None
+
+    if warfare_source:
+        if str(warfare_source).strip().lower() != "kongyo2_osint_mcp":
+            st.warning(f"OSINT feed is not MCP-backed (source={warfare_source}).")
+        else:
+            st.caption(f"OSINT source: {warfare_source}")
+    else:
+        st.warning("OSINT feed source unknown (missing system:macro:warfare:source).")
+
+    if warfare_age_s is not None:
+        st.caption(f"War feed age: {warfare_age_s:.0f}s")
+
+    battle_alert_threshold = float(os.getenv("FUNDAMENTALS_BATTLE_ALERT_ISK", "50000000000"))
+    battle_alert = warfare_isk > battle_alert_threshold
+
+    # Conflict Impact tracker (Smith & Johnson principle: higher destruction => higher mineral replacement demand)
+    conflict_scale_isk = float(os.getenv("FUNDAMENTALS_CONFLICT_SCALE_ISK", str(battle_alert_threshold)))
+    conflict_max_shift_pct = float(os.getenv("FUNDAMENTALS_CONFLICT_MAX_SHIFT_PCT", "10"))
+    conflict_norm = 0.0
+    if conflict_scale_isk > 0:
+        conflict_norm = max(0.0, min(1.0, warfare_isk / conflict_scale_isk))
+    trit_demand_shift_pct = conflict_norm * conflict_max_shift_pct
+    trit_demand_multiplier = 1.0 + (trit_demand_shift_pct / 100.0)
+
+    max_points = int(os.getenv("FUNDAMENTALS_SPARKLINE_POINTS", "60"))
+
+    # Sparklines: prefer persisted Redis history (survives dashboard restarts).
+    players_hist = _read_macro_history(redis_client=r, key="system:macro:players:history", max_points=max_points)
+    warfare_hist = _read_macro_history(redis_client=r, key="system:macro:warfare:history", max_points=max_points)
+
+    if players_hist.empty and warfare_hist.empty:
+        # Fallback: keep a short in-memory history per Streamlit session.
+        if "fundamentals_ts" not in st.session_state:
+            st.session_state["fundamentals_ts"] = []
+            st.session_state["fundamentals_players"] = []
+            st.session_state["fundamentals_warfare"] = []
+
+        st.session_state["fundamentals_ts"].append(datetime.utcnow())
+        st.session_state["fundamentals_players"].append(players_online)
+        st.session_state["fundamentals_warfare"].append(float(warfare_isk))
+
+        if len(st.session_state["fundamentals_ts"]) > max_points:
+            st.session_state["fundamentals_ts"] = st.session_state["fundamentals_ts"][-max_points:]
+            st.session_state["fundamentals_players"] = st.session_state["fundamentals_players"][-max_points:]
+            st.session_state["fundamentals_warfare"] = st.session_state["fundamentals_warfare"][-max_points:]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Market Pulse: Jita Player Count", f"{players_online:,d}")
+    c2.metric("War Intensity: ISK Destroyed", f"{warfare_isk:,.0f}")
+
+    if battle_alert:
+        # Flash red by alternating severity.
+        if int(time.time()) % 2 == 0:
+            c3.error("Volatility Alert")
+        else:
+            c3.warning("Volatility Alert")
+        st.caption(f"Alert when ISK destroyed > {battle_alert_threshold:,.0f}")
+    else:
+        c3.success("Stable")
+        st.caption(f"Alert when ISK destroyed > {battle_alert_threshold:,.0f}")
+
+    # Sparklines
+    try:
+        if not players_hist.empty or not warfare_hist.empty:
+            df_sp = pd.DataFrame(index=pd.Index([], name="ts"))
+            if not players_hist.empty:
+                df_sp = df_sp.join(players_hist.rename("Jita Population"), how="outer")
+            if not warfare_hist.empty:
+                df_sp = df_sp.join(warfare_hist.rename("War Intensity"), how="outer")
+            df_sp = df_sp.sort_index()
+        else:
+            df_sp = pd.DataFrame(
+                {
+                    "ts": st.session_state["fundamentals_ts"],
+                    "Jita Population": st.session_state["fundamentals_players"],
+                    "War Intensity": st.session_state["fundamentals_warfare"],
+                }
+            ).set_index("ts")
+        sp1, sp2 = st.columns(2)
+        sp1.caption("Jita Population (sparkline)")
+        sp1.line_chart(df_sp[["Jita Population"]], height=120)
+        sp2.caption("War Intensity (sparkline)")
+        sp2.line_chart(df_sp[["War Intensity"]], height=120)
+    except Exception:
+        pass
+
+    st.divider()
+
+    st.subheader("Jita Activity Proxy")
+    j1, j2, j3 = st.columns(3)
+    j1.metric("Jita Ship Jumps", f"{jita_jumps:,d}")
+    j2.metric("Jita Ship Kills", f"{jita_ship_kills:,d}")
+    j3.metric("Jita Pod Kills", f"{jita_pod_kills:,d}")
+    if jita_age_s is not None:
+        st.caption(f"Jita feed age: {jita_age_s:.0f}s")
+    st.subheader("Conflict Impact")
+    c_ci1, c_ci2 = st.columns(2)
+    c_ci1.metric("Tritanium Demand Shift (est.)", f"+{trit_demand_shift_pct:.2f}%")
+    c_ci2.metric("Replacement Demand Multiplier", f"{trit_demand_multiplier:.3f}×")
+    st.caption("Heuristic: demand shift scales with ISK destroyed over the last 60 minutes (bounded).")
+
+    st.subheader("Real-time Feed")
+    st.write(
+        {
+            "system:macro:players": players_online,
+            "system:macro:warfare": float(warfare_isk),
+            "battle_alert_active": bool(battle_alert),
+        }
+    )
     st.subheader("Oracle Model Status")
     model_status = "UNKNOWN"
     last_metrics = None
@@ -484,9 +753,153 @@ with tab_oracle:
         except Exception as e:
             st.error(f"Oracle status read error: {e}")
 
+    # 5090 telemetry + model precision (requested in Oracle tab)
+    skynet_temp = None
+    skynet_load = None
+    if r:
+        try:
+            skynet_temp = r.get("system:skynet:temp")
+            skynet_load = r.get("system:skynet:load")
+        except Exception:
+            pass
+
+    model_precision = 0.0
+    if isinstance(last_metrics, dict):
+        try:
+            model_precision = float(last_metrics.get("val_r2", last_metrics.get("train_r2", 0.0)) or 0.0)
+        except Exception:
+            model_precision = 0.0
+
+    # Best-effort: latest oracle confidence (from strategist radar key)
+    latest_conf = 0.0
+    try:
+        if r and raw_items:
+            top_tid = str(raw_items[0].get("type_id"))
+            radar_raw = r.get(f"market_radar:{top_tid}")
+            if radar_raw:
+                latest_conf = float(json.loads(radar_raw).get("confidence", 0.0) or 0.0)
+    except Exception:
+        latest_conf = 0.0
+
+    # Model Maturity: show R² improvement vs previous baseline as a percentage
+    prev_val_r2 = 0.0
+    if isinstance(last_metrics, dict):
+        try:
+            prev_val_r2 = float(last_metrics.get("prev_val_r2") or 0.0)
+        except Exception:
+            prev_val_r2 = 0.0
+    maturity_pct = 0.0
+    if prev_val_r2 > 0 and model_precision > prev_val_r2:
+        maturity_pct = ((model_precision - prev_val_r2) / prev_val_r2) * 100.0
+    elif model_precision > 0:
+        maturity_pct = 100.0  # baseline established
+
+    # Model Confidence: simple scale of val R² into 0..100% (tunable via env)
+    target_r2 = 0.01
+    try:
+        target_r2 = float(os.getenv("MODEL_CONFIDENCE_TARGET_R2", "0.01"))
+    except Exception:
+        target_r2 = 0.01
+    model_confidence = 0.0
+    if target_r2 > 0:
+        model_confidence = max(0.0, min(1.0, model_precision / target_r2))
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("🧠 Model Precision", f"{model_precision:.4f} R²")
+    c2.metric("🎯 Model Confidence", f"{model_confidence*100:.0f}%")
+    c3.metric("🔥 5090 Temp", f"{skynet_temp}°C" if skynet_temp is not None else "N/A")
+    c4.metric("Confidence", f"{latest_conf:.2f}")
+    c5.metric("📈 Model Maturity", f"{maturity_pct:.1f}%")
+
+    # Mean Reversion Potential indicator (BB_Upper dominance detected)
+    bb_upper_impact = 0.0
+    try:
+        drops = (((last_metrics or {}).get("features") or {}).get("importance") or {}).get("drops") or {}
+        bb_upper_impact = float(drops.get("BB_Upper", 0.0) or 0.0)
+    except Exception:
+        bb_upper_impact = 0.0
+
+    if bb_upper_impact > 0.001:
+        st.success("🔄 Mean Reversion Potential: High (BB_Upper driving predictions)")
+    elif bb_upper_impact > 0.0001:
+        st.info("🔄 Mean Reversion Potential: Moderate")
+    else:
+        st.caption("🔄 Mean Reversion Potential: Low")
+
     st.markdown(f"**Model Status:** {model_status}")
     if last_metrics:
         st.json(last_metrics)
+
+    # Feature Impact chart (Permutation importance from last training run)
+    st.subheader("Feature Impact")
+    try:
+        drops = (((last_metrics or {}).get("features") or {}).get("importance") or {}).get("drops") or {}
+        if not drops:
+            st.info("Feature impact will appear after the next training run (features.importance not yet present).")
+        else:
+            # Show the Liu indicator subset first.
+            keys = ["RSI", "MACD", "MACD_Signal", "BB_Upper", "BB_Low"]
+            vals = [float(drops.get(k, 0.0) or 0.0) for k in keys]
+            fig_imp = go.Figure()
+            fig_imp.add_trace(go.Bar(x=keys, y=vals, name="Δ val R² (shuffle)") )
+            fig_imp.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10))
+            st.plotly_chart(fig_imp, use_container_width=True)
+    except Exception as e:
+        st.error(f"Feature impact chart error: {e}")
+
+    # 📈 Accuracy Sparkline: predicted return vs actual market return (last 12 buckets)
+    st.divider()
+    st.subheader("📈 Accuracy Sparkline")
+    if not db_engine:
+        st.info("Database unavailable; cannot compute accuracy sparkline.")
+    else:
+        try:
+            horizon_minutes = 60
+            with db_engine.connect() as conn:
+                df_acc = pd.read_sql(
+                    text(
+                        """
+                        SELECT
+                            t.timestamp,
+                            t.predicted_price,
+                            t.actual_price_at_time AS entry_price,
+                            mh.close AS price_at_horizon
+                        FROM shadow_trades t
+                        LEFT JOIN LATERAL (
+                            SELECT close
+                            FROM market_history
+                            WHERE type_id = t.type_id
+                              AND timestamp >= t.timestamp + (:horizon || ' minutes')::interval
+                            ORDER BY timestamp ASC
+                            LIMIT 1
+                        ) mh ON TRUE
+                        ORDER BY t.timestamp DESC
+                        LIMIT 12
+                        """
+                    ),
+                    conn,
+                    params={"horizon": int(horizon_minutes)},
+                )
+
+            if df_acc.empty:
+                st.info("No shadow trades yet; sparkline will populate after predictions execute.")
+            else:
+                df_acc = df_acc.dropna(subset=["entry_price", "predicted_price", "price_at_horizon"]).copy()
+                if df_acc.empty:
+                    st.info("Shadow trades pending horizon prices; sparkline will populate soon.")
+                else:
+                    df_acc = df_acc.sort_values("timestamp")
+                    ep = df_acc["entry_price"].astype(float).replace(0.0, np.nan)
+                    pred_ret = (df_acc["predicted_price"].astype(float) - ep) / ep
+                    act_ret = (df_acc["price_at_horizon"].astype(float) - ep) / ep
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(y=pred_ret, mode="lines+markers", name="Predicted Return"))
+                    fig.add_trace(go.Scatter(y=act_ret, mode="lines+markers", name="Actual Return"))
+                    fig.update_layout(height=220, margin=dict(l=10, r=10, t=30, b=10))
+                    st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Sparkline error: {e}")
 
     if warmed_up:
         st.divider()
@@ -530,6 +943,135 @@ with tab_oracle:
 # ========================
 with tab_performance:
     st.markdown("### 📈 Performance Audit")
+
+    # Trade Performance Table (color-coded)
+    if db_engine:
+        try:
+            with db_engine.connect() as conn:
+                perf_df = pd.read_sql(
+                    text("""
+                        SELECT
+                            type_id,
+                            signal_type,
+                            virtual_outcome,
+                            actual_price_at_time AS entry_price,
+                            timestamp
+                        FROM shadow_trades
+                        WHERE virtual_outcome IN ('WIN', 'LOSS')
+                        ORDER BY timestamp DESC
+                        LIMIT 100
+                    """),
+                    conn,
+                )
+
+            if not perf_df.empty:
+                def _color_outcome(val):
+                    if val == "WIN":
+                        return "background-color: #28a745; color: white"
+                    elif val == "LOSS":
+                        return "background-color: #dc3545; color: white"
+                    return ""
+
+                st.subheader("Recent Trade Performance")
+                styled = perf_df.style.applymap(_color_outcome, subset=["virtual_outcome"])
+                st.dataframe(styled, use_container_width=True, height=300)
+        except Exception as e:
+            st.error(f"Trade performance table error: {e}")
+
+    st.divider()
+
+    # Item ROI Bar Chart
+    if db_engine:
+        try:
+            with db_engine.connect() as conn:
+                roi_df = pd.read_sql(
+                    text("""
+                        SELECT
+                            t.type_id,
+                            COUNT(*) AS trade_count,
+                            SUM(
+                                CASE
+                                    WHEN t.virtual_outcome = 'WIN' AND mh.close IS NOT NULL THEN
+                                        CASE
+                                            WHEN t.signal_type = 'BUY' THEN (mh.close - t.actual_price_at_time)
+                                            ELSE (t.actual_price_at_time - mh.close)
+                                        END
+                                    ELSE 0
+                                END
+                            ) AS net_profit
+                        FROM shadow_trades t
+                        LEFT JOIN LATERAL (
+                            SELECT close
+                            FROM market_history
+                            WHERE type_id = t.type_id
+                              AND timestamp >= t.timestamp + INTERVAL '60 minutes'
+                            ORDER BY timestamp ASC
+                            LIMIT 1
+                        ) mh ON TRUE
+                        WHERE t.virtual_outcome IN ('WIN', 'LOSS')
+                        GROUP BY t.type_id
+                        ORDER BY net_profit DESC
+                        LIMIT 20
+                    """),
+                    conn,
+                )
+
+            if not roi_df.empty:
+                st.subheader("Top 20 Items by Net Profit (ROI)")
+                type_names = resolve_type_names(roi_df["type_id"].tolist())
+                roi_df["item_name"] = roi_df["type_id"].apply(lambda x: type_names.get(str(x), f"Type {x}"))
+                fig_roi = go.Figure(
+                    go.Bar(
+                        x=roi_df["net_profit"],
+                        y=roi_df["item_name"],
+                        orientation="h",
+                        marker=dict(
+                            color=roi_df["net_profit"],
+                            colorscale="RdYlGn",
+                            showscale=True,
+                        ),
+                    )
+                )
+                fig_roi.update_layout(title="Item ROI", xaxis_title="Net Profit (ISK)", yaxis_title="Item")
+                st.plotly_chart(fig_roi, use_container_width=True)
+        except Exception as e:
+            st.error(f"Item ROI chart error: {e}")
+
+    st.divider()
+
+    # Chapter 9: ISK Preservation (Forced Exit / Stop-Loss)
+    if db_engine:
+        try:
+            stop_loss_pct = float(os.getenv("SHADOW_STOP_LOSS_PCT", "0.015"))
+        except Exception:
+            stop_loss_pct = 0.015
+
+        try:
+            with db_engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT
+                            COUNT(*)::bigint AS shield_activations,
+                            COALESCE(SUM(actual_price_at_time * :sl), 0)::double precision AS virtual_isk_protected
+                        FROM shadow_trades
+                        WHERE forced_exit = TRUE
+                          AND actual_price_at_time IS NOT NULL
+                        """
+                    ),
+                    {"sl": float(stop_loss_pct)},
+                ).fetchone()
+
+            shield_activations = int(row[0] or 0)
+            virtual_isk_protected = float(row[1] or 0.0)
+
+            c_fx1, c_fx2 = st.columns(2)
+            c_fx1.metric("Shield Activations", f"{shield_activations}")
+            c_fx2.metric("Virtual ISK Protected", f"{virtual_isk_protected:,.2f}")
+            st.caption(f"Assumes stop-loss = {stop_loss_pct*100:.2f}% of entry price per forced exit.")
+            st.divider()
+        except Exception as e:
+            st.error(f"Forced-exit audit error: {e}")
 
     # Last 24h Performance (from daily alpha job)
     if r:
@@ -635,6 +1177,95 @@ with tab_performance:
         c2.metric("Win Rate % (resolved)", f"{win_rate:.1f}%")
 
         st.divider()
+
+        # --- Sharpe Ratio Audit ---
+        try:
+            with db_engine.connect() as conn:
+                # Fetch last 100 resolved trades to compute Sharpe
+                sharpe_df = pd.read_sql(
+                    text(
+                        """
+                        SELECT
+                            t.actual_price_at_time as entry_price,
+                            mh.close as exit_price,
+                            t.signal_type,
+                            t.forced_exit
+                        FROM shadow_trades t
+                        LEFT JOIN LATERAL (
+                            SELECT close
+                            FROM market_history
+                            WHERE type_id = t.type_id
+                              AND timestamp >= t.timestamp + (:horizon || ' minutes')::interval
+                            ORDER BY timestamp ASC
+                            LIMIT 1
+                        ) mh ON TRUE
+                        WHERE t.virtual_outcome IN ('WIN', 'LOSS')
+                        ORDER BY t.timestamp DESC
+                        LIMIT 100
+                        """
+                    ),
+                    conn,
+                    params={"horizon": int(horizon_minutes)}
+                )
+
+            if not sharpe_df.empty:
+                # Calculate simple returns
+                def calc_return(row):
+                    if row['forced_exit']:
+                        # Stop-loss can widen during high-volatility warfare events.
+                        try:
+                            warfare_isk = float(r.get("system:macro:warfare") or 0.0)
+                        except Exception:
+                            warfare_isk = 0.0
+
+                        try:
+                            warfare_threshold = float(os.getenv("SHADOW_WARFARE_THRESHOLD_ISK", "0"))
+                        except Exception:
+                            warfare_threshold = 0.0
+
+                        stop_loss_pct = 0.015
+                        try:
+                            stop_loss_pct = float(os.getenv("SHADOW_STOP_LOSS_PCT", "0.015"))
+                        except Exception:
+                            stop_loss_pct = 0.015
+
+                        if warfare_threshold > 0 and warfare_isk > warfare_threshold:
+                            try:
+                                stop_loss_pct = float(os.getenv("SHADOW_WAR_STOP_LOSS_PCT", "0.03"))
+                            except Exception:
+                                stop_loss_pct = 0.03
+
+                        return -abs(float(stop_loss_pct))
+                    
+                    if row['entry_price'] == 0 or pd.isna(row['exit_price']):
+                        return 0.0
+                    
+                    if row['signal_type'] == 'BUY':
+                        return (row['exit_price'] - row['entry_price']) / row['entry_price']
+                    else:
+                        return (row['entry_price'] - row['exit_price']) / row['entry_price']
+
+                sharpe_df['ret'] = sharpe_df.apply(calc_return, axis=1)
+
+                # Bardol winsorization clamp to stabilize Sharpe audit.
+                sharpe_df['ret'] = sharpe_df['ret'].clip(lower=-1.0, upper=10.0)
+                
+                rp = sharpe_df['ret'].mean()
+                sigma_p = sharpe_df['ret'].std()
+                
+                sharpe = (rp / sigma_p) if sigma_p > 0 else 0.0
+                
+                st.subheader("Risk Audit (Last 100 Trades)")
+                c_s1, c_s2, c_s3 = st.columns(3)
+                c_s1.metric("Sharpe Ratio", f"{sharpe:.4f}")
+                c_s2.metric("Exp. Return", f"{rp*100:.3f}%")
+                c_s3.metric("Volatility (σ)", f"{sigma_p*100:.3f}%")
+                st.caption(f"Based on {len(sharpe_df)} resolved trades. (Rf=0)")
+                st.divider()
+
+        except Exception as e:
+            st.warning(f"Sharpe calc error: {e}")
+
         st.subheader("Live Ledger: Last 10 Ghost Trades")
         try:
             with db_engine.connect() as conn:
@@ -655,7 +1286,8 @@ with tab_performance:
                                     ELSE (t.actual_price_at_time - mh.close) * (1 - :fee)
                                 END
                             ) AS virtual_profit_net,
-                            t.virtual_outcome
+                            t.virtual_outcome,
+                            t.forced_exit
                         FROM shadow_trades t
                         LEFT JOIN LATERAL (
                             SELECT close
@@ -678,6 +1310,12 @@ with tab_performance:
                 tmap = resolve_type_names(tids)
                 df["type_id"] = df["type_id"].astype(str).map(lambda x: tmap.get(x, x))
                 df.rename(columns={"type_id": "Item"}, inplace=True)
+                # Render forced exits distinctly
+                if "forced_exit" in df.columns:
+                    df["virtual_outcome"] = df.apply(
+                        lambda row: "FORCED_EXIT" if bool(row.get("forced_exit")) else row.get("virtual_outcome"),
+                        axis=1,
+                    )
                 st.dataframe(df, use_container_width=True, height=360)
             else:
                 st.info("No shadow trades recorded yet.")
@@ -766,10 +1404,19 @@ with tab_system:
 
             if do_eula:
                 try:
-                    # Short TTL so stale requests don't linger.
-                    r.setex("system:zombie:force_entry", 30, "force")
-                    r.setex("system:zombie:eula_accept", 30, "sweep")
-                    st.success("EULA bypass requested.")
+                    # Safety: only allow hardware actions when HARDWARE_LOCK is disabled.
+                    lock_val = r.get("system:hardware_lock")
+                    locked = lock_val is None or str(lock_val).lower() in {"true", "1", "yes"}
+                    if locked:
+                        st.warning("Hardware lock is enabled. Disable HARDWARE_LOCK to send the handshake.")
+                    else:
+                        # Trigger the Arduino hardware handshake (END -> 500ms -> RETURN).
+                        r.setex("system:hardware:handshake", 30, "true")
+
+                        # Visual flush: clear cached screenshot so the next frame shows post-accept state.
+                        r.delete("system:zombie:screenshot")
+
+                        st.success("Hardware handshake sent.")
                 except Exception as e:
                     st.error(f"Failed to request clearance sweep: {e}")
         else:
@@ -804,6 +1451,30 @@ with tab_system:
                 shot_b64 = None
         else:
             shot_b64 = None
+
+        # --- Client state indicator (AUTO-ZOMBIE flip) ---
+        client_state = None
+        window_title = None
+        scanned_at = None
+        if r:
+            try:
+                client_state = r.get("system:zombie:client_state")
+                window_title = r.get("system:zombie:window_title")
+                scanned_at = r.get("system:zombie:window_scanned_at")
+            except Exception:
+                pass
+
+        if client_state and str(client_state).upper() == "AUTO_ZOMBIE":
+            st.success("🟢 AUTO-ZOMBIE")
+        elif window_title and ("EVE Online" in window_title or "Character Selection" in window_title or window_title.startswith("EVE - ")):
+            st.success("🟢 AUTO-ZOMBIE")
+        else:
+            st.info("🟠 ZOMBIE: Awaiting State Transition")
+
+        if window_title:
+            st.caption(f"Window: {window_title}")
+        if scanned_at:
+            st.caption(f"Scanned: {scanned_at}")
 
         if shot_b64:
             try:
