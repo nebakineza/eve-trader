@@ -1,0 +1,11 @@
+[Unit]
+Description=Run EVE Trader disk-aware cleanup guard every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=eve-trader-disk-guard.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

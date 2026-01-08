@@ -1,0 +1,7 @@
+[Unit]
+Description=EVE Trader disk-aware cleanup guard
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/seb/nebakineza/eve-trader
+ExecStart=/usr/bin/python3 /home/seb/nebakineza/eve-trader/scripts/disk_guard.py --keep-hours 48 --max-ratio 0.75 --target-ratio 0.70
