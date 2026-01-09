@@ -99,9 +99,11 @@ def _detect_display(*, candidates: list[str], patterns: list[str]) -> str | None
                 timeout=3,
             )
             decoded = out.decode("utf-8", errors="ignore")
-            if rx.search(decoded):
-                logger.info("Auto-selected DISPLAY=%s (matched window name)", disp)
-                return disp
+            # Parse line by line to exclude "EVE Launcher" false positives
+            for line in decoded.splitlines():
+                if rx.search(line) and "launcher" not in line.lower():
+                    logger.info("Auto-selected DISPLAY=%s (matched window: %s)", disp, line.strip())
+                    return disp
         except Exception:
             continue
     return None

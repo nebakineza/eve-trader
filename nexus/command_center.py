@@ -887,9 +887,30 @@ with tab_oracle:
         st.success(f"✅ Sequence Readiness: {readiness_text}")
         st.success("✅ Signal Depth Sufficient. 5090 Training Authorized.")
 
-    st.info(
-        "Run on 5090: curl -o training_data.parquet http://192.168.14.105:8001/training_data_cleaned.parquet && python3 -m oracle.train_model"
-    )
+        # Model Lineage & Health
+        try:
+            # Display lineage chart instead of raw curl commands
+            history_raw = r.lrange("oracle:training_lineage", 0, 19)
+            if history_raw:
+                hist_data = [json.loads(x) for x in history_raw]
+                # Sort by timestamp ascending for chart
+                hist_data.reverse() 
+                
+                df_hist = pd.DataFrame(hist_data)
+                if not df_hist.empty and "val_r2" in df_hist.columns:
+                    st.caption("Model Lineage: Validation R² (Last 20 Runs)")
+                    
+                    # Highlight status
+                    latest_run = hist_data[-1]
+                    status_color = "green" if latest_run.get("accepted") else "orange"
+                    status_text = "OPTIMIZING" if latest_run.get("accepted") else "REJECTED"
+                    st.markdown(f"**Training Health:** :{status_color}[{status_text}] (Val R²: {latest_run.get('val_r2', 0):.3f})")
+
+                    st.line_chart(df_hist.set_index("ts")[["val_r2", "train_r2"]], height=200)
+            else:
+                 st.info("No training lineage available yet.")
+        except Exception as e:
+            st.warning(f"Could not load training lineage: {e}")
 
     st.divider()
 

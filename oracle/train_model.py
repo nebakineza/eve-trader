@@ -802,6 +802,8 @@ def train(cfg: TrainingConfig) -> str:
                 "state_dict": model.state_dict(),
                 "created_at": ts,
                 "device": str(device),
+                "epochs": cfg.epochs,
+                "loss": last_loss,
                 "input_dim": 10,
                 "target": "return",
                 "output_activation": (output_activation or "linear"),
@@ -853,6 +855,7 @@ def train(cfg: TrainingConfig) -> str:
         metrics = {
             "timestamp": ts,
             "loss": last_loss,
+            "epochs": cfg.epochs,
             "device": str(device),
             "gpu_name": gpu_name,
             "gpu_capability": gpu_capability,
@@ -880,7 +883,21 @@ def train(cfg: TrainingConfig) -> str:
                 "importance": feature_importance,
             },
         }
-        r.set("oracle:last_training_metrics", json.dumps(metrics))
+        try:
+            r.set("oracle:last_training_metrics", json.dumps(metrics))
+            # Maintain lineage history (last 50 runs)
+            history_payload = json.dumps({
+                "ts": ts,
+                "train_r2": float(train_r2),
+                "val_r2": float(val_r2),
+                "loss": float(last_loss) if isinstance(last_loss, (float, int)) else 0.0,
+                "accepted": bool(accepted),
+                "status": "LIVE" if accepted else "REJECTED"
+            })
+            r.lpush("oracle:training_lineage", history_payload)
+            r.ltrim("oracle:training_lineage", 0, 49)
+        except Exception:
+            pass
 
         # Dedicated key for the UI/ops audit: the dashboard and operators can fetch
         # this without parsing the full metrics blob.
