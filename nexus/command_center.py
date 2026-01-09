@@ -1428,76 +1428,48 @@ with tab_performance:
                     # Filter for Winners/Losers Tabs
                     tab_w, tab_l = st.tabs(["🏆 Winners", "📉 Losers"])
                     
-                    with tab_w:
-                        try:
-                            # User-Directed Query: Ensure explicit filtering on shadow_trades
-                            q_w = text("SELECT * FROM shadow_trades WHERE profit_net > 0 AND status = 'RESOLVED' ORDER BY profit_net DESC LIMIT 20")
-                            with db_engine.connect() as conn:
-                                winners = pd.read_sql(q_w, conn)
+                    # Define color helper for Status column
+                    def _color_outcome(val):
+                        if str(val) == "WIN": return "background-color: #28a745; color: white"
+                        if str(val) == "LOSS": return "background-color: #dc3545; color: white"
+                        return ""
 
-                            if not winners.empty:
-                                if "type_id" in winners.columns:
-                                    w_ids = [int(x) for x in winners["type_id"].dropna().unique().tolist()]
-                                    w_names = resolve_type_names(w_ids)
-                                    winners["item_name"] = winners["type_id"].apply(lambda x: w_names.get(str(int(x)), f"Type {int(x)}"))
-                                
-                                # Available columns might differ from CSV export, map what we can
-                                disp_cols = {
-                                    "timestamp": "Timestamp", 
-                                    "item_name": "Item", 
-                                    "actual_price_at_time": "Price (Entry)", 
-                                    "entry_price": "Price (Entry)", # Fallback
-                                    "profit_net": "Net ISK", 
-                                    "status": "Status",
-                                    "reasoning": "Strategy Logic"
+                    with tab_w:
+                         # Use python-side filtering on the enhanced 'ledger' dataframe
+                         winners = ledger[(ledger["profit_net"] > 0) & (ledger["status"] == "WIN")].sort_values("profit_net", ascending=False)
+                         if not winners.empty:
+                             show_w = winners[list(ledger_cols.keys())].rename(columns=ledger_cols)
+                             st.dataframe(
+                                show_w.style.map(_color_outcome, subset=["Status"]),
+                                use_container_width=True,
+                                height=400,
+                                column_config={
+                                    "Strategy Logic": st.column_config.TextColumn(width="medium"),
+                                    "Timestamp": st.column_config.DatetimeColumn(format="D MMM HH:mm"),
+                                    "Net ISK": st.column_config.NumberColumn(format="%.2f ISK"),
+                                    "Price (Entry)": st.column_config.NumberColumn(format="%.2f ISK")
                                 }
-                                # Dynamic selection
-                                use_cols = [c for c in disp_cols.keys() if c in winners.columns]
-                                show_w = winners[use_cols].rename(columns=disp_cols)
-                                
-                                st.dataframe(
-                                   show_w.style.map(lambda v: "color: green" if v == "RESOLVED" else "", subset=["Status"] if "Status" in show_w.columns else None),
-                                   use_container_width=True,
-                                   height=400
-                                )
-                            else:
-                                st.info("No realized wins in current window.")
-                        except Exception as e:
-                            st.warning(f"Could not load Winners: {e}")
+                             )
+                         else:
+                             st.info("No realized wins in current window.")
 
                     with tab_l:
-                        try:
-                            q_l = text("SELECT * FROM shadow_trades WHERE profit_net < 0 AND status = 'RESOLVED' ORDER BY profit_net ASC LIMIT 20")
-                            with db_engine.connect() as conn:
-                                losers = pd.read_sql(q_l, conn)
-                            
-                            if not losers.empty:
-                                if "type_id" in losers.columns:
-                                    l_ids = [int(x) for x in losers["type_id"].dropna().unique().tolist()]
-                                    l_names = resolve_type_names(l_ids)
-                                    losers["item_name"] = losers["type_id"].apply(lambda x: l_names.get(str(int(x)), f"Type {int(x)}"))
-                                    
-                                disp_cols = {
-                                    "timestamp": "Timestamp", 
-                                    "item_name": "Item", 
-                                    "actual_price_at_time": "Price (Entry)", 
-                                    "entry_price": "Price (Entry)",
-                                    "profit_net": "Net ISK", 
-                                    "status": "Status",
-                                    "reasoning": "Strategy Logic"
+                         losers = ledger[(ledger["profit_net"] <= 0) & (ledger["status"] == "LOSS")].sort_values("profit_net", ascending=True)
+                         if not losers.empty:
+                             show_l = losers[list(ledger_cols.keys())].rename(columns=ledger_cols)
+                             st.dataframe(
+                                show_l.style.map(_color_outcome, subset=["Status"]),
+                                use_container_width=True,
+                                height=400,
+                                column_config={
+                                    "Strategy Logic": st.column_config.TextColumn(width="medium"),
+                                    "Timestamp": st.column_config.DatetimeColumn(format="D MMM HH:mm"),
+                                    "Net ISK": st.column_config.NumberColumn(format="%.2f ISK"),
+                                    "Price (Entry)": st.column_config.NumberColumn(format="%.2f ISK")
                                 }
-                                use_cols = [c for c in disp_cols.keys() if c in losers.columns]
-                                show_l = losers[use_cols].rename(columns=disp_cols)
-                                
-                                st.dataframe(
-                                   show_l.style.map(lambda v: "color: red" if v == "RESOLVED" else "", subset=["Status"] if "Status" in show_l.columns else None),
-                                   use_container_width=True,
-                                   height=400
-                                )
-                            else:
-                                st.success("No realized losses in current window.")
-                        except Exception as e:
-                            st.warning(f"Could not load Losers: {e}")
+                             )
+                         else:
+                             st.success("No realized losses in current window.")
                 except Exception as e:
                     st.error(f"Ledger error: {e}")
             else:
