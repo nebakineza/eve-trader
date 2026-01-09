@@ -326,9 +326,9 @@ async def main():
                             predicted_price=float(predicted_price) if predicted_price is not None else None,
                             current_price=float(current_price) if current_price is not None else None,
                             confidence=float(confidence) if confidence is not None else 0.0,
-                            prediction_spread=float(features.get('spread', 0.0))
                             warfare_isk_60m=warfare_isk,
                             global_market_cap_isk=global_cap_isk,
+                            prediction_spread=float(features.get('spread', 0.0))
                         )
                     except Exception as e:
                         logger.warning(f"Shadow record error for {type_id}: {e}")
