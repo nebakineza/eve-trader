@@ -120,6 +120,7 @@ def get_shadow_trade_outcomes_df(limit: int = 100, horizon_minutes: int = 60, fe
                     t.actual_price_at_time AS entry_price,
                     mh.close AS exit_price,
                     t.reasoning,
+                    t.virtual_outcome,
                     t.timestamp
                 FROM shadow_trades t
                 LEFT JOIN LATERAL (
@@ -1353,9 +1354,14 @@ with tab_performance:
                     return gross * (1.0 - 0.025)
 
                 dfp["profit_net"] = dfp.apply(_profit_net, axis=1)
-                dfp["status"] = dfp["profit_net"].apply(
-                    lambda v: "PENDING" if pd.isna(v) else ("WIN" if float(v) > 0 else "LOSS")
-                )
+                
+                # Trust the DB Virtual Outcome if available (Authoritative source)
+                if "virtual_outcome" in dfp.columns:
+                    dfp["status"] = dfp["virtual_outcome"].fillna("PENDING")
+                else:
+                    dfp["status"] = dfp["profit_net"].apply(
+                        lambda v: "PENDING" if pd.isna(v) else ("WIN" if float(v) > 0 else "LOSS")
+                    )
 
                 def _color_profit(v):
                     if v is None or pd.isna(v):

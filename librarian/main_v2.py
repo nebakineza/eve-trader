@@ -370,11 +370,12 @@ async def main():
 
                 if players_online is not None and players_online > 0:
                     # Keep TTL modest so consumers can detect staleness.
-                    bridge.redis_client.set("system:macro:players", str(players_online), ex=600)
-                    bridge.redis_client.set("system:macro:players:updated_at", str(now.timestamp()), ex=600)
+                    # Update: Using longer TTL (1h) to support LKG during prolonged outages.
+                    bridge.redis_client.set("system:macro:players", str(players_online), ex=3600)
+                    bridge.redis_client.set("system:macro:players:updated_at", str(now.timestamp()), ex=3600)
                     # Best-effort provenance
                     source = "kongyo2_osint_mcp" if os.getenv("KONGYO2_OSINT_MCP_ENDPOINT", "").strip() else "esi_or_eve_offline"
-                    bridge.redis_client.set("system:macro:players:source", str(source), ex=600)
+                    bridge.redis_client.set("system:macro:players:source", str(source), ex=3600)
 
                     # Prime history if empty so Fundamentals charts don't read as zero.
                     # Seed two points to give the chart a stable baseline line.
