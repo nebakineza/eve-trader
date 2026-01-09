@@ -8,7 +8,7 @@
 set -o pipefail
 
 # Log to explicit file or stdout
-LOGFILE="/var/log/eve_singleton_guard.log"
+LOGFILE="/tmp/eve_singleton_guard.log"
 
 log() {
     echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $1" | tee -a "$LOGFILE"
@@ -30,7 +30,7 @@ if [ "$COUNT" -gt 1 ]; then
     
     log "Restarting Zombie Client..."
     # Execute init script in background, detaching output to avoid hanging cron
-    /home/seb/eve-trader/scripts/zombie_init.sh >> /var/log/eve_zombie_init.log 2>&1 &
+    /home/seb/eve-trader/scripts/zombie_init.sh >> /tmp/eve_zombie_init.log 2>&1 &
     
     log "Restart command issued."
 else
