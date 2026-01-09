@@ -699,7 +699,10 @@ with tab_oracle:
 
     val_r2 = 0.0
     train_r2 = 0.0
+    prev_val_r2 = 0.0
+    loss_last = 0.0
     reject_reason = None
+    
     if r:
         try:
             metrics_raw = r.get("oracle:last_training_metrics")
@@ -709,6 +712,12 @@ with tab_oracle:
                     # Direct fields (on successful training runs)
                     val_r2 = float(metrics.get("val_r2", 0.0) or 0.0)
                     train_r2 = float(metrics.get("train_r2", 0.0) or 0.0)
+                    prev_val_r2 = float(metrics.get("baseline_val_r2", 0.0) or 0.0) # Often stored as baseline
+                    
+                    # Try to get loss
+                    # If metrics has 'history' or 'final_loss'
+                    loss_last = float(metrics.get("loss", 0.0) or 0.0)
+                    
                     reject_reason = metrics.get("reject_reason")
 
                     # On reject paths, val_r2/prev_val_r2 may only appear in the error string.
@@ -743,10 +752,40 @@ with tab_oracle:
     except Exception:
         next_training_eta = "N/A"
 
+    # -- Alpha Ledger (Model Comparison) --
+    st.markdown("#### 📜 The Oracle 'Alpha Ledger'")
+    
+    alpha_data = {
+        "Metric": ["Val R² (Current)", "Val R² (Previous Best)", "Training R²", "Induction Loss", "Status"],
+        "Value": [
+            f"{val_r2:.4f}",
+            f"{prev_val_r2:.4f}", 
+            f"{train_r2:.4f}",
+            f"{loss_last:.4f}",
+            "REJECTED" if reject_reason else "ACTIVE"
+        ],
+        "Delta": [
+            f"{(val_r2 - prev_val_r2):+.4f}",
+            "-",
+            "-",
+            "Stable",
+            "-"
+        ]
+    }
+    st.dataframe(pd.DataFrame(alpha_data), use_container_width=True, hide_index=True)
+
+    # -- Parameter Audit --
+    with st.expander(" Strategist Coefficients (Parameter Audit)", expanded=False):
+        c_p1, c_p2, c_p3 = st.columns(3)
+        # Mapping generic Greek terms to our internal config for "Developer" feel
+        c_p1.metric("Alpha (Confidence)", os.getenv("SHADOW_CONFIDENCE_THRESHOLD", "0.60"))
+        c_p2.metric("Beta (Horizon)", f"{os.getenv('SHADOW_HORIZON_MINUTES', '60')}m")
+        c_p3.metric("Gamma (Fee Rate)", f"{float(os.getenv('SHADOW_FEE_RATE', '0.025'))*100:.1f}%")
+
     c_m1, c_m2, c_m3 = st.columns(3)
     c_m1.metric("Model Path", model_path_used.split("/")[-1])
-    c_m2.metric("Validation R²", f"{val_r2:.4f}")
-    c_m3.metric("Next Training", next_training_eta)
+    c_m2.metric("Next Training", next_training_eta)
+    c_m3.empty() 
 
     # Show full model path for operator debugging.
     try:
@@ -1309,9 +1348,16 @@ with tab_performance:
                     ledger["item_name"] = ledger["type_id"].apply(lambda x: type_names.get(str(int(x)), f"Type {int(x)}") if pd.notna(x) else "Unknown")
                     ledger["reasoning"] = ledger.get("reasoning")
 
-                    # Only show resolved outcomes in the ledger.
-                    resolved = ledger[ledger["status"].isin(["WIN", "LOSS"])].copy()
-                    resolved["outcome"] = resolved["status"].apply(lambda s: "GREEN" if str(s).upper() == "WIN" else "RED")
+                    # Only show resolved outcomes in the ledger (Plus PENDING for visibility).
+                    resolved = ledger[ledger["status"].isin(["WIN", "LOSS", "PENDING"])].copy()
+                    
+                    def _derive_outcome_label(status):
+                        s = str(status).upper()
+                        if s == "WIN": return "GREEN"
+                        if s == "LOSS": return "RED"
+                        return "LIVE" # PENDING
+
+                    resolved["outcome"] = resolved["status"].apply(_derive_outcome_label)
 
                     def _color_outcome(v):
                         s = str(v or "").upper()
@@ -1319,10 +1365,12 @@ with tab_performance:
                             return "background-color: #28a745; color: white"
                         if s == "RED":
                             return "background-color: #dc3545; color: white"
+                        if s == "LIVE":
+                            return "background-color: #6c757d; color: white"
                         return ""
 
                     show = resolved[["timestamp", "item_name", "reasoning", "outcome"]].head(100)
-                    st.dataframe(show.style.applymap(_color_outcome, subset=["outcome"]), use_container_width=True, height=260)
+                    st.dataframe(show.style.map(_color_outcome, subset=["outcome"]), use_container_width=True, height=260)
                 except Exception as e:
                     st.error(f"Winner's Ledger error: {e}")
             else:

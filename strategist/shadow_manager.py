@@ -286,7 +286,7 @@ class ShadowManager:
                     {"tid": int(type_id), "ts": ts, "horizon": int(self.config.horizon_minutes)},
                 ).fetchone()
 
-                if not exit_row:
+                if not exit_row or exit_row[0] is None:
                     continue
 
                 exit_price = float(exit_row[0])
