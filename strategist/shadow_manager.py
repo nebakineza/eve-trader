@@ -104,13 +104,14 @@ class ShadowManager:
         # Smith & Johnson Reasoning Factory (operator-audit grade)
         try:
             reasoning = (
+                f"Conf={confidence:.2f} | "
                 f"Smith & Johnson Demand Shift: {demand_shift:+.2%} | "
                 f"Spread: {prediction_spread:.4f} | "
                 f"Warfare Pulse: {warfare_b:.1f} B ISK | "
                 f"Predicted Return: {predicted_return:+.1%}"
             )
         except Exception:
-            reasoning = f"Predicted Return: {predicted_return:+.1%}"
+            reasoning = f"Conf={confidence:.2f} | Predicted Return: {predicted_return:+.1%}"
 
         # Dedupe: avoid spamming repeated signals for the same type_id.
         # If there is already a PENDING entry within the last horizon window, skip.

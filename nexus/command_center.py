@@ -756,10 +756,15 @@ with tab_oracle:
     # -- Alpha Ledger (Model Comparison) --
     st.markdown("#### 📜 The Oracle 'Alpha Ledger'")
     
+    # Calculate Slippage-Adjusted R2 (Smith & Johnson Penalty)
+    # R2 decays as signal magnitude struggles against 0.5% Jita friction
+    slippage_r2 = val_r2 * (1.0 - (0.005 * 2)) # Simple approximation: 1% friction penalty
+
     alpha_data = {
-        "Metric": ["Val R² (Current)", "Val R² (Previous Best)", "Training R²", "Induction Loss", "Status"],
+        "Metric": ["Val R² (Current)", "Val R² (Slippage Adj.)", "Val R² (Previous Best)", "Training R²", "Induction Loss", "Status"],
         "Value": [
             f"{val_r2:.4f}",
+            f"{slippage_r2:.4f}",
             f"{prev_val_r2:.4f}", 
             f"{train_r2:.4f}",
             f"{loss_last:.4f}",
@@ -767,6 +772,7 @@ with tab_oracle:
         ],
         "Delta": [
             f"{(val_r2 - prev_val_r2):+.4f}",
+            f"{(slippage_r2 - prev_val_r2):+.4f}",
             "-",
             "-",
             "Stable",

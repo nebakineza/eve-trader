@@ -370,9 +370,11 @@ def main() -> int:
     interval = max(10, int(args.interval_seconds))
     logger.info("ZombieShot loop started (display=%s interval=%ss)", args.display, interval)
     while True:
-        # Blind-fire Escape to clear modals
+        # Blind-fire Escape and Return to clear modals (Wine, EVE Launcher)
         try:
              subprocess.run(["xdotool", "key", "Escape"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+             time.sleep(0.5)
+             subprocess.run(["xdotool", "key", "Return"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
              pass
 
