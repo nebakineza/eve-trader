@@ -53,6 +53,8 @@ class ShadowManager:
         predicted_price: float | None,
         current_price: float | None,
         confidence: float,
+        warfare_isk_60m: float | None = None,
+        global_market_cap_isk: float | None = None,
     ) -> bool:
         if confidence is None or confidence < self.config.confidence_threshold:
             return False
@@ -62,21 +64,50 @@ class ShadowManager:
 
         signal_type = "BUY" if predicted_price >= current_price else "SELL"
 
-        edge_pct = 0.0
+        predicted_return = 0.0
         try:
-            if float(current_price) > 0:
-                edge_pct = (float(predicted_price) - float(current_price)) / float(current_price)
+            cp = float(current_price)
+            pp = float(predicted_price)
+            if cp > 0:
+                if signal_type == "BUY":
+                    predicted_return = (pp - cp) / cp
+                else:
+                    predicted_return = (cp - pp) / cp
         except Exception:
-            edge_pct = 0.0
+            predicted_return = 0.0
 
+        war_isk = 0.0
+        try:
+            if warfare_isk_60m is not None:
+                war_isk = float(warfare_isk_60m)
+        except Exception:
+            war_isk = 0.0
+
+        cap_isk = None
+        try:
+            if global_market_cap_isk is not None:
+                cap_isk = float(global_market_cap_isk)
+        except Exception:
+            cap_isk = None
+
+        demand_shift = 0.0
+        try:
+            if cap_isk and cap_isk > 0:
+                demand_shift = float(war_isk) / float(cap_isk)
+        except Exception:
+            demand_shift = 0.0
+
+        warfare_b = float(war_isk) / 1e9
+
+        # Smith & Johnson Reasoning Factory (operator-audit grade)
         try:
             reasoning = (
-                f"{signal_type} | conf={float(confidence):.3f} | "
-                f"pred={float(predicted_price):.4f} vs px={float(current_price):.4f} | "
-                f"edge={edge_pct:+.2%}"
+                f"Smith & Johnson Demand Shift: {demand_shift:+.2%} | "
+                f"Warfare Pulse: {warfare_b:.1f} B ISK | "
+                f"Predicted Return: {predicted_return:+.1%}"
             )
         except Exception:
-            reasoning = f"{signal_type} | conf={confidence}"
+            reasoning = f"Predicted Return: {predicted_return:+.1%}"
 
         # Dedupe: avoid spamming repeated signals for the same type_id.
         # If there is already a PENDING entry within the last horizon window, skip.

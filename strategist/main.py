@@ -7,6 +7,7 @@ import aiohttp
 import sqlalchemy
 from sqlalchemy import text
 from datetime import datetime
+from urllib.parse import urlparse
 
 sys.path.append(os.getcwd())
 
@@ -59,6 +60,9 @@ async def main():
             return "<redacted>"
 
     logger.info(f"DB URL: {_redact_db_url(db_url)}")
+
+    oracle_host = os.getenv("ORACLE_HOST", "http://oracle:8000")
+    logger.info(f"Oracle host: {oracle_host}")
     
     # DB Engine for Direct Queries
     db_engine = sqlalchemy.create_engine(db_url.replace("asyncpg", "psycopg2")) if "postgresql" in db_url else None
@@ -81,8 +85,14 @@ async def main():
     logger.info(f"Listening for Oracle Signals (SYSTEM_MODE={os.getenv('SYSTEM_MODE', 'SHADOW')})")
     logger.info("Strategist Main Loop Started (Rate: 5 mins)")
 
+    oracle_is_up = False
+
     while True:
         try:
+            oracle_success_this_tick = False
+            oracle_offline_logged = False
+            oracle_non_200_logged = False
+
             # Dynamic thresholding (Bayesian tuner can update Redis continuously)
             if shadow is not None:
                 try:
@@ -101,7 +111,28 @@ async def main():
 
             if shadow is not None:
                 try:
-                    settled = shadow.settle_pending_trades()
+                    # Traffic Guardrails: widen stop-loss during high-volatility warfare.
+                    warfare_isk = 0.0
+                    try:
+                        v = bridge.redis_client.get("system:macro:warfare")
+                        if v is not None:
+                            warfare_isk = float(v)
+                    except Exception:
+                        warfare_isk = 0.0
+
+                    warfare_threshold = float(os.getenv("SHADOW_WARFARE_THRESHOLD_ISK", "0"))
+                    war_stop_loss_pct = float(os.getenv("SHADOW_WAR_STOP_LOSS_PCT", "0.03"))
+                    stop_loss_override = None
+                    if warfare_threshold > 0 and warfare_isk > warfare_threshold:
+                        stop_loss_override = war_stop_loss_pct
+                        logger.warning(
+                            "Traffic Guardrail ACTIVE: warfare_isk=%.2f > threshold=%.2f -> stop_loss=%.3f",
+                            warfare_isk,
+                            warfare_threshold,
+                            war_stop_loss_pct,
+                        )
+
+                    settled = shadow.settle_pending_trades(stop_loss_pct_override=stop_loss_override)
                     if settled:
                         logger.info(f"Shadow ledger: settled {settled} pending trades")
                 except Exception as e:
@@ -217,7 +248,7 @@ async def main():
                 # Real features would serve just the raw dict if Oracle handles it.
 
                 # 2. Call Oracle
-                host = os.getenv("ORACLE_HOST", "http://oracle:8000")
+                host = oracle_host
                 oracle_response = None
 
                 try:
@@ -225,8 +256,33 @@ async def main():
                         async with session.post(f"{host}/predict", json={"features": features}) as resp:
                             if resp.status == 200:
                                 oracle_response = await resp.json()
+                                oracle_success_this_tick = True
+
+                                if not oracle_is_up:
+                                    try:
+                                        parsed = urlparse(host)
+                                        origin = parsed.hostname or host
+                                    except Exception:
+                                        origin = host
+                                    logger.info(f"Inference Received from {origin}")
+                                    oracle_is_up = True
+                            else:
+                                try:
+                                    body = await resp.text()
+                                except Exception:
+                                    body = ""
+                                if not oracle_non_200_logged:
+                                    logger.warning(
+                                        "Oracle non-200: status=%s host=%s body=%s",
+                                        resp.status,
+                                        host,
+                                        (body[:200] if body else ""),
+                                    )
+                                    oracle_non_200_logged = True
                 except Exception as e:
-                    logger.warning(f"Oracle offline for {type_id}: {e}")
+                    if not oracle_offline_logged:
+                        logger.warning(f"Oracle offline (host={host}): {e}")
+                        oracle_offline_logged = True
 
                 # Fallback / Mock if Oracle not ready yet (during bootstrap)
                 if not oracle_response:
@@ -238,11 +294,29 @@ async def main():
 
                 if shadow is not None:
                     try:
+                        warfare_isk = None
+                        global_cap_isk = None
+                        try:
+                            v = bridge.redis_client.get("system:macro:warfare")
+                            if v is not None:
+                                warfare_isk = float(v)
+                        except Exception:
+                            warfare_isk = None
+
+                        try:
+                            v = bridge.redis_client.get("system:macro:global_market_cap")
+                            if v is not None:
+                                global_cap_isk = float(v)
+                        except Exception:
+                            global_cap_isk = None
+
                         shadow.maybe_record_intended_trade(
                             type_id=type_id,
                             predicted_price=float(predicted_price) if predicted_price is not None else None,
                             current_price=float(current_price) if current_price is not None else None,
                             confidence=float(confidence) if confidence is not None else 0.0,
+                            warfare_isk_60m=warfare_isk,
+                            global_market_cap_isk=global_cap_isk,
                         )
                     except Exception as e:
                         logger.warning(f"Shadow record error for {type_id}: {e}")
@@ -291,6 +365,10 @@ async def main():
                 # To keep it simple, we'll access the private _pool if available or create one.
                 if hasattr(bridge, 'pool'):
                     await update_market_radar(bridge.pool, type_id, signal_strength, predicted_price, current_price, status)
+
+            if oracle_is_up and not oracle_success_this_tick:
+                logger.warning(f"Oracle connection lost (host={oracle_host})")
+                oracle_is_up = False
                 
         except Exception as e:
             logger.error(f"Strategist Loop Error: {e}")

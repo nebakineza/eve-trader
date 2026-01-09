@@ -8,6 +8,7 @@ services:
   db:
     image: timescale/timescaledb:latest-pg14
     container_name: eve-trader-db
+    mem_limit: 2g
     environment:
       - POSTGRES_PASSWORD=eve_pass
       - POSTGRES_USER=eve_user
@@ -44,6 +45,7 @@ services:
   librarian:
     build: .
     container_name: eve-trader-librarian
+    mem_limit: 1g
     command: python -m librarian.main_v2
     depends_on:
       - db
@@ -51,6 +53,9 @@ services:
     environment:
       - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
       - REDIS_URL=redis://cache:6379/0
+      - KONGYO2_OSINT_MCP_ENDPOINT=${KONGYO2_OSINT_MCP_ENDPOINT:-}
+      - WAR_ZKILL_ESI_TIME_LOOKUP=1
+      - WAR_ZKILL_ESI_TIME_LOOKUP_MAX=30
     volumes:
       - .:/app
     networks:
@@ -65,6 +70,7 @@ services:
   nexus-dashboard:
     build: .
     container_name: eve-trader-nexus-dashboard
+    mem_limit: 512m
     command: streamlit run nexus/command_center.py --server.port 8501 --server.address 0.0.0.0
     ports:
       - "8501:8501"
@@ -96,8 +102,10 @@ services:
       - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
       - REDIS_URL=redis://cache:6379/0
       - SYSTEM_MODE=SHADOW
-      - ORACLE_HOST=http://192.168.14.105:8000
+      - ORACLE_HOST=${ORACLE_HOST:-http://192.168.10.108:8000}
       - SHADOW_CONFIDENCE_THRESHOLD=0.35
+    volumes:
+      - ./:/app
     networks:
       - eve_net
     restart: unless-stopped
@@ -108,7 +116,10 @@ services:
         max-file: "3"
 
   oracle:
-    build: .
+    build:
+      context: .
+      args:
+        REQUIREMENTS_FILE: requirements.oracle.txt
     container_name: eve-trader-oracle
     command: uvicorn oracle.main:app --host 0.0.0.0 --port 8000
     depends_on:
@@ -133,11 +144,22 @@ services:
     command: python scripts/arduino_bridge.py
     depends_on:
       - cache
+      - db
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
     environment:
       - REDIS_URL=redis://cache:6379/0
+      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
       - ARDUINO_PORT=/dev/ttyACM0
       - ARDUINO_BAUD=9600
+      - ARDUINO_DRY_RUN=0
       - RETRY_SECONDS=5
+      - ARDUINO_CONFIDENCE_THRESHOLD=0.92
+      - ARDUINO_SHARPE_GATE_ENABLED=1
+      - ARDUINO_MIN_SHARPE_4H=1.5
+      - ARDUINO_SHARPE_LOOKBACK_HOURS=4
+    volumes:
+      - ./:/app
     networks:
       - eve_net
     restart: unless-stopped
@@ -190,11 +212,58 @@ services:
   historian:
     build: .
     container_name: eve-trader-historian
+    mem_limit: 1g
     command: python scripts/market_historian.py --loop --region-id 10000002 --bucket-minutes 5 --lookback-minutes 5
     depends_on:
       - db
     environment:
       - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - REDIS_URL=redis://cache:6379/0
+    volumes:
+      - ./:/app
+    networks:
+      - eve_net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  historian-cleanup:
+    build: .
+    container_name: eve-trader-historian-cleanup
+    mem_limit: 256m
+    command: python scripts/cleanup_market_history.py --loop --keep-hours 48 --interval-seconds 3600
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+    volumes:
+      - ./:/app
+    networks:
+      - eve_net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  war-historian:
+    build: .
+    container_name: eve-trader-war-historian
+    mem_limit: 256m
+    command: python scripts/war_historian.py
+    depends_on:
+      - cache
+    environment:
+      - REDIS_URL=redis://cache:6379/0
+      - WAR_LOOKBACK_MINUTES=60
+      - WAR_POLL_SECONDS=300
+      - WAR_TTL_SECONDS=600
+      # Optional MCP-first endpoint (preferred when configured)
+      - KONGYO2_OSINT_MCP_ENDPOINT=${KONGYO2_OSINT_MCP_ENDPOINT:-}
     volumes:
       - ./:/app
     networks:

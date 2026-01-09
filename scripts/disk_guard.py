@@ -25,19 +25,14 @@ def _bytes(n: int) -> str:
     return f"{n:.1f}TB"
 
 
-def _dir_size_bytes(root: Path) -> int:
-    total = 0
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Avoid descending into heavy/critical state.
-        # We never delete inside these, and they can be root-owned.
-        dirnames[:] = [d for d in dirnames if d not in {"postgres", "redis"}]
-        for name in filenames:
-            p = Path(dirpath) / name
-            try:
-                total += p.stat().st_size
-            except Exception:
-                continue
-    return int(total)
+def _disk_used_ratio(root: Path) -> float:
+    try:
+        disk = shutil.disk_usage(str(root))
+        if disk.total <= 0:
+            return 0.0
+        return float(disk.used) / float(disk.total)
+    except Exception:
+        return 0.0
 
 
 def _find_candidates(data_dir: Path, pattern: str) -> list[Candidate]:
@@ -60,44 +55,81 @@ def _delete(p: Path, dry_run: bool) -> None:
 
 
 def run_once(*, data_dir: Path, keep_hours: int, max_ratio: float, target_ratio: float, pattern: str, dry_run: bool) -> int:
+    # We keep the CLI surface compatible with existing systemd units.
+    # Behavior upgrade:
+    # - Guardrail triggers on overall disk utilization (used/total), not just data_dir size.
+    # - When guard trips, prune both old parquet exports and logs to prevent SSH lockout.
+
+    root = Path(__file__).resolve().parents[1]
     data_dir = data_dir.resolve()
+    logs_dir = (root / "logs").resolve()
+
     if not data_dir.exists() or not data_dir.is_dir():
         print(f"ERROR: data_dir not found: {data_dir}", file=sys.stderr)
         return 2
 
-    disk = shutil.disk_usage(str(data_dir))
-    disk_total = int(disk.total)
-
-    # 1) Standard retention: delete matching files older than keep_hours.
+    # 1) Standard retention: delete matching exports older than keep_hours.
     if keep_hours > 0:
         cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=int(keep_hours))
         cutoff_ts = cutoff.timestamp()
-        candidates = _find_candidates(data_dir, pattern)
-        old = [c for c in candidates if c.mtime < cutoff_ts]
-        for c in old:
-            print(f"retention delete {c.path.name} size={_bytes(c.size)} mtime={datetime.fromtimestamp(c.mtime, tz=timezone.utc).isoformat()}")
-            _delete(c.path, dry_run=dry_run)
 
-    # 2) Guardrail: if data_dir grows beyond max_ratio of total disk, delete oldest matching files until target.
-    data_size = _dir_size_bytes(data_dir)
-    ratio = (data_size / disk_total) if disk_total > 0 else 0.0
+        # Parquet exports (data/)
+        parquet_patterns = [
+            str(pattern or "refinery_*.parquet"),
+            "oracle_training_*.parquet",
+            "training_data_*.parquet",
+        ]
+        for pat in parquet_patterns:
+            for c in _find_candidates(data_dir, pat):
+                if c.mtime < cutoff_ts:
+                    print(
+                        f"retention delete {c.path.as_posix()} size={_bytes(c.size)} mtime={datetime.fromtimestamp(c.mtime, tz=timezone.utc).isoformat()}"
+                    )
+                    _delete(c.path, dry_run=dry_run)
 
+        # Logs (logs/)
+        if logs_dir.exists() and logs_dir.is_dir():
+            for c in _find_candidates(logs_dir, "*.log"):
+                if c.mtime < cutoff_ts:
+                    print(
+                        f"retention delete {c.path.as_posix()} size={_bytes(c.size)} mtime={datetime.fromtimestamp(c.mtime, tz=timezone.utc).isoformat()}"
+                    )
+                    _delete(c.path, dry_run=dry_run)
+
+    # 2) Guardrail: if overall disk utilization exceeds max_ratio, delete oldest exports/logs until target.
+    ratio = _disk_used_ratio(data_dir)
     if ratio < max_ratio:
-        print(f"ok data_size={_bytes(data_size)} disk_total={_bytes(disk_total)} ratio={ratio:.3f} (<{max_ratio})")
+        disk = shutil.disk_usage(str(data_dir))
+        print(
+            f"ok disk_used={_bytes(int(disk.used))} disk_total={_bytes(int(disk.total))} ratio={ratio:.3f} (<{max_ratio})"
+        )
         return 0
 
-    print(f"GUARD TRIP data_size={_bytes(data_size)} disk_total={_bytes(disk_total)} ratio={ratio:.3f} (>= {max_ratio})")
-    candidates = _find_candidates(data_dir, pattern)
+    disk = shutil.disk_usage(str(data_dir))
+    print(
+        f"GUARD TRIP disk_used={_bytes(int(disk.used))} disk_total={_bytes(int(disk.total))} ratio={ratio:.3f} (>= {max_ratio})"
+    )
+
+    candidates: list[Candidate] = []
+    # Mix candidates across data/ and logs/, oldest-first.
+    for pat in [str(pattern or "refinery_*.parquet"), "oracle_training_*.parquet", "training_data_*.parquet"]:
+        candidates.extend(_find_candidates(data_dir, pat))
+    if logs_dir.exists() and logs_dir.is_dir():
+        candidates.extend(_find_candidates(logs_dir, "*.log"))
+    candidates.sort(key=lambda c: (c.mtime, c.path.as_posix()))
+
     deleted = 0
     while candidates and ratio >= target_ratio:
         c = candidates.pop(0)
-        print(f"guard delete {c.path.name} size={_bytes(c.size)}")
+        print(f"guard delete {c.path.as_posix()} size={_bytes(c.size)}")
         _delete(c.path, dry_run=dry_run)
         deleted += 1
-        data_size = _dir_size_bytes(data_dir)
-        ratio = (data_size / disk_total) if disk_total > 0 else 0.0
+        ratio = _disk_used_ratio(data_dir)
 
-    print(f"guard done deleted={deleted} data_size={_bytes(data_size)} ratio={ratio:.3f} target<{target_ratio}")
+    disk2 = shutil.disk_usage(str(data_dir))
+    print(
+        f"guard done deleted={deleted} disk_used={_bytes(int(disk2.used))} ratio={ratio:.3f} target<{target_ratio}"
+    )
     return 0
 
 

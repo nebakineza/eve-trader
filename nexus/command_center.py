@@ -757,6 +757,45 @@ with tab_oracle:
     if reject_reason:
         st.warning(f"🚫 Last Induction Rejected: {reject_reason}")
 
+    # 10D Feature Importance Audit (Top 5)
+    fi_obj = None
+    if r:
+        try:
+            raw = r.get("oracle:feature_importance")
+            if raw:
+                fi_obj = json.loads(raw)
+        except Exception:
+            fi_obj = None
+
+    if isinstance(fi_obj, dict) and isinstance(fi_obj.get("drops"), dict) and fi_obj.get("drops"):
+        try:
+            drops = fi_obj.get("drops") or {}
+            items = [(str(k), float(v)) for k, v in drops.items()]
+            items.sort(key=lambda kv: kv[1], reverse=True)
+            top = items[:5]
+
+            st.subheader("Top Feature Importance (Val R² Drop)")
+            df_fi = pd.DataFrame({"feature": [k for k, _ in top], "val_r2_drop": [v for _, v in top]})
+            fig_fi = go.Figure(
+                go.Bar(
+                    x=df_fi["val_r2_drop"],
+                    y=df_fi["feature"],
+                    orientation="h",
+                    name="Val R² drop",
+                )
+            )
+            fig_fi.update_layout(
+                height=260,
+                margin=dict(l=10, r=10, t=30, b=10),
+                xaxis_title="Δ Val R² (higher = more important)",
+                yaxis_title="",
+            )
+            st.plotly_chart(fig_fi, use_container_width=True)
+        except Exception as e:
+            st.error(f"Feature importance chart error: {e}")
+    else:
+        st.caption("Feature importance not available yet (will appear after the next 10D training run).")
+
     st.divider()
 
     # Sequence Readiness: count distinct 5-minute buckets in the last 12 hours.

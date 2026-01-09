@@ -729,7 +729,7 @@ def train(cfg: TrainingConfig) -> str:
                 return _r2(y_all, p_all)
 
             drops = {}
-            for i, name in enumerate(FEATURE_NAMES_7D):
+            for i, name in enumerate(FEATURE_NAMES_10D):
                 r2_perm = float(_predict_r2_with_permuted_feature(val_ds, i))
                 drops[name] = float(baseline_r2 - r2_perm)
 
@@ -881,6 +881,14 @@ def train(cfg: TrainingConfig) -> str:
             },
         }
         r.set("oracle:last_training_metrics", json.dumps(metrics))
+
+        # Dedicated key for the UI/ops audit: the dashboard and operators can fetch
+        # this without parsing the full metrics blob.
+        try:
+            if feature_importance is not None:
+                r.set("oracle:feature_importance", json.dumps(feature_importance))
+        except Exception:
+            pass
         r.set("oracle:model_latest_path", str(model_path))
         if accepted:
             r.set("oracle:model_status", "LIVE" if cfg.set_live_after_train else "IDLE")
