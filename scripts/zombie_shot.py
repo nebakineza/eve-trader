@@ -140,9 +140,57 @@ def _wayland_env_for_current_user() -> dict[str, str] | None:
     }
 
 
-def _capture_x11(*, display: str, png_path: str) -> None:
-    scrot = _require_tool("scrot")
+def _maximize_game_window(display: str) -> None:
+    """Use xdotool to maximize and focus the main EVE window (skipping Launchers)"""
+    xdotool = shutil.which("xdotool")
+    if not xdotool:
+        logger.warning("xdotool not found; skipping window maximization")
+        return
 
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+
+    try:
+        # 1. Find the window ID of the game client.
+        # Exclude 'EVE Launcher' explicitly. Look for 'EVE' or 'Wine' which usually contain the client.
+        # We search for "EVE" but grep -v Launcher to filter.
+        # `xdotool search --name "EVE"` might return multiple.
+        
+        # Command pipeline: xdotool search --name "EVE" | xargs -I {} xdotool getwindowname {}
+        # We do this in Python for better control.
+        out = subprocess.check_output([xdotool, "search", "--name", "EVE"], env=env, stderr=subprocess.DEVNULL)
+        window_ids = out.decode().strip().split()
+        
+        target_wid = None
+        for wid in window_ids:
+            try:
+                name_bytes = subprocess.check_output([xdotool, "getwindowname", wid], env=env, stderr=subprocess.DEVNULL)
+                name = name_bytes.decode().lower()
+                if "launcher" in name:
+                    continue
+                # Found a candidate that is likely the client
+                target_wid = wid
+                break
+            except subprocess.CalledProcessError:
+                continue
+
+        if target_wid:
+            logger.info("Maximizing Game Window ID: %s", target_wid)
+            subprocess.run([xdotool, "windowactivate", target_wid], env=env, check=False)
+            subprocess.run([xdotool, "windowsize", target_wid, "100%", "100%"], env=env, check=False)
+            subprocess.run([xdotool, "windowfocus", target_wid], env=env, check=False)
+            
+            # Allow WM to settle animation
+            time.sleep(1.0)
+    except Exception as e:
+        logger.warning(f"Failed to maximize EVE window: {e}")
+
+
+def _capture_x11(*, display: str, png_path: str) -> None:
+    # Pre-flight: Maximize the game window to ensure we don't capture background/launcher
+    _maximize_game_window(display)
+
+    scrot = _require_tool("scrot")
     env = os.environ.copy()
     env["DISPLAY"] = display
 

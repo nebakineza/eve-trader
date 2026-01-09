@@ -1389,13 +1389,18 @@ with tab_performance:
                         return "background-color: #6c757d; color: white"  # PENDING
                     return "background-color: #28a745; color: white" if float(v) > 0 else "background-color: #dc3545; color: white"
 
-                st.subheader("Recent Trade Performance")
+
+                st.subheader("Recent Trade Performance (Biggest Wins)")
+                
+                # Sort by profit_net DESC to show biggest winners first
+                dfp = dfp.sort_values(by="profit_net", ascending=False)
+                
                 show_cols = [c for c in ["timestamp", "type_id", "signal_type", "entry_price", "exit_price", "profit_net", "status"] if c in dfp.columns]
                 styled = dfp[show_cols].style.applymap(_color_profit, subset=["profit_net"])
                 st.dataframe(styled, use_container_width=True, height=300)
 
                 # Winner's Ledger: per-trade reasoning + outcome color.
-                st.subheader("Winner's Ledger")
+                st.subheader("Trading Ledger")
                 try:
                     # Resolve item names
                     type_ids = [int(x) for x in dfp["type_id"].dropna().astype(int).tolist()]
@@ -1403,49 +1408,57 @@ with tab_performance:
                     ledger = dfp.copy()
                     ledger["item_name"] = ledger["type_id"].apply(lambda x: type_names.get(str(int(x)), f"Type {int(x)}") if pd.notna(x) else "Unknown")
                     ledger["reasoning"] = ledger.get("reasoning")
-
-                    # Only show resolved outcomes in the ledger (Plus PENDING for visibility).
-                    resolved = ledger[ledger["status"].isin(["WIN", "LOSS", "PENDING"])].copy()
                     
-                    def _derive_outcome_label(status):
-                        s = str(status).upper()
-                        if s == "WIN": return "GREEN"
-                        if s == "LOSS": return "RED"
-                        return "LIVE" # PENDING
+                    # Columns aligned with EVE Wallet
+                    ledger_cols = {
+                        "timestamp": "Timestamp", 
+                        "item_name": "Item", 
+                        "entry_price": "Price (Entry)", 
+                        "profit_net": "Net ISK", 
+                        "status": "Status",
+                        "reasoning": "Strategy Logic"
+                    }
+                    
+                    # Filter for Winners/Losers Tabs
+                    tab_w, tab_l = st.tabs(["🏆 Winners", "📉 Losers"])
+                    
+                    with tab_w:
+                         winners = ledger[(ledger["profit_net"] > 0) & (ledger["status"] == "WIN")].sort_values("profit_net", ascending=False)
+                         if not winners.empty:
+                             show_w = winners[list(ledger_cols.keys())].rename(columns=ledger_cols)
+                             st.dataframe(
+                                show_w.style.map(_color_outcome, subset=["Status"]),
+                                use_container_width=True,
+                                height=400,
+                                column_config={
+                                    "Strategy Logic": st.column_config.TextColumn(width="medium"),
+                                    "Timestamp": st.column_config.DatetimeColumn(format="D MMM HH:mm"),
+                                    "Net ISK": st.column_config.NumberColumn(format="%.2f ISK"),
+                                    "Price (Entry)": st.column_config.NumberColumn(format="%.2f ISK")
+                                }
+                             )
+                         else:
+                             st.info("No realized wins in current window.")
 
-                    resolved["outcome"] = resolved["status"].apply(_derive_outcome_label)
-
-                    def _color_outcome(v):
-                        s = str(v or "").upper()
-                        if s == "GREEN":
-                            return "background-color: #28a745; color: white"
-                        if s == "RED":
-                            return "background-color: #dc3545; color: white"
-                        if s == "LIVE":
-                            return "background-color: #6c757d; color: white"
-                        return ""
-
-                    show = resolved[["timestamp", "item_name", "reasoning", "outcome"]].head(100)
-                    # Polish: Formatting columns for readable reasoning
-                    st.dataframe(
-                        show.style.map(_color_outcome, subset=["outcome"]),
-                        use_container_width=True,
-                        height=260,
-                        column_config={
-                            "reasoning": st.column_config.TextColumn(
-                                "Analysis (Smith & Johnson)",
-                                help="AI Reasoning logic including Demand Shift and Volatility",
-                                width="large",
-                                max_chars=None
-                            ),
-                            "timestamp": st.column_config.DatetimeColumn(
-                                "Execute Time (UTC)",
-                                format="D MMM, HH:mm"
-                            )
-                        }
-                    )
+                    with tab_l:
+                         losers = ledger[(ledger["profit_net"] <= 0) & (ledger["status"] == "LOSS")].sort_values("profit_net", ascending=True)
+                         if not losers.empty:
+                             show_l = losers[list(ledger_cols.keys())].rename(columns=ledger_cols)
+                             st.dataframe(
+                                show_l.style.map(_color_outcome, subset=["Status"]),
+                                use_container_width=True,
+                                height=400,
+                                column_config={
+                                    "Strategy Logic": st.column_config.TextColumn(width="medium"),
+                                    "Timestamp": st.column_config.DatetimeColumn(format="D MMM HH:mm"),
+                                    "Net ISK": st.column_config.NumberColumn(format="%.2f ISK"),
+                                    "Price (Entry)": st.column_config.NumberColumn(format="%.2f ISK")
+                                }
+                             )
+                         else:
+                             st.success("No realized losses in current window.")
                 except Exception as e:
-                    st.error(f"Winner's Ledger error: {e}")
+                    st.error(f"Ledger error: {e}")
             else:
                 st.info("No shadow trades recorded yet.")
         except Exception as e:
