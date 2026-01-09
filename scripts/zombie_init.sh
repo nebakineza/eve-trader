@@ -51,6 +51,13 @@ elif [ -n "${DISPLAY:-}" ]; then
 else
     export DISPLAY=":0"
 fi
+
+# Suppress Wine crash dialogs and debug prompts
+export WINEDBG=disabled
+# Ensure we map to the standard Wine prefix if not set
+if [ -z "$WINEPREFIX" ]; then
+    export WINEPREFIX="$HOME/.wine"
+fi
 export DRI_PRIME=1
 export PROTON_NO_ESYNC=1
 export PROTON_NO_FSYNC=1

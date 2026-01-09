@@ -370,6 +370,12 @@ def main() -> int:
     interval = max(10, int(args.interval_seconds))
     logger.info("ZombieShot loop started (display=%s interval=%ss)", args.display, interval)
     while True:
+        # Blind-fire Escape to clear modals
+        try:
+             subprocess.run(["xdotool", "key", "Escape"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+             pass
+
         try:
             capture_once(
                 display=args.display,
