@@ -93,6 +93,42 @@ def get_hypertable_sizes_df() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
+def get_resolved_trades_df(outcome_filter: str, limit: int = 50, horizon_minutes: int = 60) -> pd.DataFrame:
+    if not db_engine:
+        return pd.DataFrame()
+    
+    # outcome_filter should be 'WIN' or 'LOSS'
+    with db_engine.connect() as conn:
+        return pd.read_sql(
+            text(
+                """
+                SELECT
+                    t.type_id,
+                    t.signal_type,
+                    t.actual_price_at_time AS entry_price,
+                    mh.close AS exit_price,
+                    t.reasoning,
+                    t.virtual_outcome as status,
+                    t.timestamp
+                FROM shadow_trades t
+                LEFT JOIN LATERAL (
+                    SELECT close
+                    FROM market_history
+                    WHERE type_id = t.type_id
+                      AND timestamp >= t.timestamp + (:horizon || ' minutes')::interval
+                    ORDER BY timestamp ASC
+                    LIMIT 1
+                ) mh ON TRUE
+                WHERE t.virtual_outcome = :outcome
+                ORDER BY t.timestamp DESC
+                LIMIT :limit
+                """
+            ),
+            conn,
+            params={"limit": int(limit), "horizon": int(horizon_minutes), "outcome": outcome_filter},
+        )
+
+@st.cache_data(ttl=300)
 def get_shadow_trade_outcomes_df(limit: int = 100, horizon_minutes: int = 60, fee_rate: float = 0.025) -> pd.DataFrame:
     if not db_engine:
         return pd.DataFrame()
@@ -1433,14 +1469,46 @@ with tab_performance:
                         if str(val) == "WIN": return "background-color: #28a745; color: white"
                         if str(val) == "LOSS": return "background-color: #dc3545; color: white"
                         return ""
+                    
+                    # Calculate Profit Net helper
+                    def _calc_profit(df):
+                        if df.empty: return df
+                        df["entry_price"] = pd.to_numeric(df.get("entry_price"), errors="coerce")
+                        df["exit_price"] = pd.to_numeric(df.get("exit_price"), errors="coerce")
+                        def _pn(row):
+                            ep = row.get("entry_price")
+                            xp = row.get("exit_price")
+                            if ep is None or xp is None or pd.isna(ep) or pd.isna(xp) or float(ep) <= 0:
+                                return np.nan
+                            if str(row.get("signal_type", "")).upper() == "BUY":
+                                gross = float(xp) - float(ep)
+                            else:
+                                gross = float(ep) - float(xp)
+                            return gross * (1.0 - 0.025)
+                        df["profit_net"] = df.apply(_pn, axis=1)
+                        return df
 
                     with tab_w:
-                         # Use python-side filtering on the enhanced 'ledger' dataframe
-                         winners = ledger[(ledger["profit_net"] > 0) & (ledger["status"] == "WIN")].sort_values("profit_net", ascending=False)
+                         # Fetch known WINs directly from DB
+                         winners_raw = get_resolved_trades_df("WIN", limit=50)
+                         winners = _calc_profit(winners_raw)
+                         
                          if not winners.empty:
-                             show_w = winners[list(ledger_cols.keys())].rename(columns=ledger_cols)
+                             # Re-sort by calculated profit just in case
+                             winners = winners.sort_values("profit_net", ascending=False)
+                             
+                             # Name resolution
+                             if "type_id" in winners.columns:
+                                w_ids = [int(x) for x in winners["type_id"].dropna().unique().tolist()]
+                                w_names = resolve_type_names(w_ids)
+                                winners["item_name"] = winners["type_id"].apply(lambda x: w_names.get(str(int(x)), f"Type {int(x)}"))
+                             
+                             show_w = winners.rename(columns=ledger_cols)
+                             # safe select
+                             show_cols = [c for c in ledger_cols.values() if c in show_w.columns]
+                             
                              st.dataframe(
-                                show_w.style.map(_color_outcome, subset=["Status"]),
+                                show_w[show_cols].style.map(_color_outcome, subset=["Status"]),
                                 use_container_width=True,
                                 height=400,
                                 column_config={
@@ -1451,14 +1519,25 @@ with tab_performance:
                                 }
                              )
                          else:
-                             st.info("No realized wins in current window.")
+                             st.info("No realized wins found in history.")
 
                     with tab_l:
-                         losers = ledger[(ledger["profit_net"] <= 0) & (ledger["status"] == "LOSS")].sort_values("profit_net", ascending=True)
+                         losers_raw = get_resolved_trades_df("LOSS", limit=50)
+                         losers = _calc_profit(losers_raw)
+                         
                          if not losers.empty:
-                             show_l = losers[list(ledger_cols.keys())].rename(columns=ledger_cols)
+                             losers = losers.sort_values("profit_net", ascending=True)
+
+                             if "type_id" in losers.columns:
+                                l_ids = [int(x) for x in losers["type_id"].dropna().unique().tolist()]
+                                l_names = resolve_type_names(l_ids)
+                                losers["item_name"] = losers["type_id"].apply(lambda x: l_names.get(str(int(x)), f"Type {int(x)}"))
+                             
+                             show_l = losers.rename(columns=ledger_cols)
+                             show_cols = [c for c in ledger_cols.values() if c in show_l.columns]
+                             
                              st.dataframe(
-                                show_l.style.map(_color_outcome, subset=["Status"]),
+                                show_l[show_cols].style.map(_color_outcome, subset=["Status"]),
                                 use_container_width=True,
                                 height=400,
                                 column_config={
@@ -1469,7 +1548,7 @@ with tab_performance:
                                 }
                              )
                          else:
-                             st.success("No realized losses in current window.")
+                             st.success("No realized losses found in history.")
                 except Exception as e:
                     st.error(f"Ledger error: {e}")
             else:
