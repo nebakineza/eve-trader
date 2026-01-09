@@ -22,7 +22,9 @@
 # - MIN_PARQUET_BYTES (default 17000000)
 # - VENV_PATH (default .venv-blackwell)
 # - EPOCHS (default 50)
+# - LEARNING_RATE (default 0.001)  # passed to oracle.train_model via env
 # - LOOKBACK_MINUTES (default 120)
+# - SKIP_REMOTE_SYNC (default 0)
 
 set -euo pipefail
 
@@ -31,11 +33,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEBIAN_HOST="${DEBIAN_HOST:-192.168.14.105}"
 DEBIAN_USER="${DEBIAN_USER:-seb}"
 DEBIAN_REPO_DIR="${DEBIAN_REPO_DIR:-~/eve-trader}"
-PARQUET_URL="${PARQUET_URL:-http://192.168.14.105:8001/training_data_cleaned.parquet}"
+PARQUET_URL_DEFAULT="http://${DEBIAN_HOST}:8001/training_data_cleaned.parquet"
+PARQUET_URL="${PARQUET_URL:-$PARQUET_URL_DEFAULT}"
 MIN_PARQUET_BYTES="${MIN_PARQUET_BYTES:-17000000}"
 VENV_PATH="${VENV_PATH:-.venv-blackwell}"
 EPOCHS="${EPOCHS:-50}"
 LOOKBACK_MINUTES="${LOOKBACK_MINUTES:-120}"
+SKIP_REMOTE_SYNC="${SKIP_REMOTE_SYNC:-0}"
+SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-10}"
 
 PRINT_CRON=0
 for arg in "$@"; do
@@ -66,8 +71,10 @@ require_cmd() {
 }
 
 require_cmd python3
-require_cmd ssh
-require_cmd scp
+if [[ "$SKIP_REMOTE_SYNC" != "1" ]]; then
+  require_cmd ssh
+  require_cmd scp
+fi
 
 # curl or wget for parquet retrieval
 if command -v curl >/dev/null 2>&1; then
@@ -129,14 +136,41 @@ if [[ ! -f "$LATEST_LOCAL" ]]; then
 fi
 
 log "Sync indicators.py to Debian (sha check)"
+if [[ "$SKIP_REMOTE_SYNC" == "1" ]]; then
+  log "SKIP_REMOTE_SYNC=1 set; skipping Debian sync steps"
+  log "Done"
+  exit 0
+fi
+
+# Preflight SSH so we can surface host-key issues cleanly.
+set +e
+SSH_PREFLIGHT_OUT="$(ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" "$DEBIAN_USER@$DEBIAN_HOST" "echo ok" 2>&1)"
+SSH_PREFLIGHT_RC=$?
+set -e
+if [[ "$SSH_PREFLIGHT_RC" != "0" ]]; then
+  if echo "$SSH_PREFLIGHT_OUT" | grep -qi "Host key verification failed"; then
+    echo "SSH host key verification failed for $DEBIAN_USER@$DEBIAN_HOST" >&2
+    echo "Fix on SkyNet by running:" >&2
+    echo "  ssh-keygen -R $DEBIAN_HOST" >&2
+    echo "  ssh $DEBIAN_USER@$DEBIAN_HOST" >&2
+    exit 6
+  fi
+  echo "SSH preflight failed for $DEBIAN_USER@$DEBIAN_HOST: $SSH_PREFLIGHT_OUT" >&2
+  exit 6
+fi
+
 LOCAL_SHA="$(sha256sum "$ROOT_DIR/oracle/indicators.py" | awk '{print $1}')"
-REMOTE_SHA="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$DEBIAN_USER@$DEBIAN_HOST" "sha256sum $DEBIAN_REPO_DIR/oracle/indicators.py 2>/dev/null | awk '{print \$1}'" || true)"
+REMOTE_SHA="$(ssh -o BatchMode=yes -o ConnectTimeout=$SSH_CONNECT_TIMEOUT "$DEBIAN_USER@$DEBIAN_HOST" "sha256sum $DEBIAN_REPO_DIR/oracle/indicators.py 2>/dev/null | awk '{print \$1}'" || true)"
 if [[ "$LOCAL_SHA" != "$REMOTE_SHA" ]]; then
   log "Remote indicators mismatch (local=$LOCAL_SHA remote=${REMOTE_SHA:-missing}); syncing"
   scp "$ROOT_DIR/oracle/indicators.py" "$DEBIAN_USER@$DEBIAN_HOST:$DEBIAN_REPO_DIR/oracle/indicators.py"
 fi
 
 log "Sync oracle_v1_latest.pt to Debian models/"
+# If Debian has oracle_v1_latest.pt as a symlink (from previous runs), scp will
+# follow it and overwrite the *target* file, leaving the symlink pointing at an
+# older filename. Remove it first so it becomes a real file.
+ssh -o BatchMode=yes -o ConnectTimeout=$SSH_CONNECT_TIMEOUT "$DEBIAN_USER@$DEBIAN_HOST" "mkdir -p $DEBIAN_REPO_DIR/models && rm -f $DEBIAN_REPO_DIR/models/oracle_v1_latest.pt" || true
 scp "$LATEST_LOCAL" "$DEBIAN_USER@$DEBIAN_HOST:$DEBIAN_REPO_DIR/models/oracle_v1_latest.pt"
 
 log "Done"

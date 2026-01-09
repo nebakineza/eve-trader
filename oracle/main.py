@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -82,7 +83,53 @@ def _build_sequence_from_features(
     bb_u_rel = (bb_u_raw / p_safe) - 1.0
     bb_l_rel = (bb_l_raw / p_safe) - 1.0
 
-    vec = [velocity, imbalance, rsi_scaled, macd_rel, macd_sig_rel, bb_u_rel, bb_l_rel]
+    players_raw = _as_float(features.get("players_online"), 0.0)
+    if players_raw < 0:
+        players_raw = 0.0
+    # Match training scaling: log1p(players) / log1p(100000)
+    try:
+        players_scaled = math.log1p(players_raw) / math.log1p(100000.0)
+    except Exception:
+        players_scaled = 0.0
+
+    warfare_raw = _as_float(features.get("warfare_isk_destroyed"), 0.0)
+    if warfare_raw < 0:
+        warfare_raw = 0.0
+    war_scale = _as_float(os.getenv("ORACLE_WARFARE_LOG_SCALE_ISK", "10000000000000"), 10000000000000.0)
+    if war_scale <= 0:
+        war_scale = 10000000000000.0
+    try:
+        war_scaled = math.log1p(warfare_raw) / math.log1p(war_scale)
+    except Exception:
+        war_scaled = 0.0
+
+    # Macro-Inertia: Demand_Shift = ISK_Destroyed_60m / Global_Market_Cap
+    # Use the same stable log-ratio mapping as training.
+    global_cap = _as_float(
+        features.get("global_market_cap")
+        if features.get("global_market_cap") is not None
+        else os.getenv("ORACLE_GLOBAL_MARKET_CAP_ISK", "1000000000000000"),
+        1000000000000000.0,
+    )
+    if global_cap <= 0:
+        global_cap = 1.0
+    try:
+        demand_shift_scaled = math.log1p(warfare_raw) / math.log1p(global_cap)
+    except Exception:
+        demand_shift_scaled = 0.0
+
+    vec = [
+        velocity,
+        imbalance,
+        rsi_scaled,
+        macd_rel,
+        macd_sig_rel,
+        bb_u_rel,
+        bb_l_rel,
+        float(players_scaled),
+        float(war_scaled),
+        float(demand_shift_scaled),
+    ]
 
     if input_dim > len(vec):
         vec = vec + [0.0] * (input_dim - len(vec))
@@ -195,6 +242,7 @@ async def health():
         "requested_device": REQUESTED_DEVICE,
         "cuda_available": bool(getattr(torch, "cuda", None) and torch.cuda.is_available()),
         "model_target": (MODEL_META or {}).get("target") if isinstance(MODEL_META, dict) else None,
+        "model_output_activation": (MODEL_META or {}).get("output_activation") if isinstance(MODEL_META, dict) else None,
     }
 
 class MarketFeatures(BaseModel):
@@ -237,6 +285,13 @@ async def predict(data: MarketFeatures):
         target = (MODEL_META or {}).get("target") if isinstance(MODEL_META, dict) else None
         pred_price = pred_raw
         if target == "return":
+            activation = (MODEL_META or {}).get("output_activation") if isinstance(MODEL_META, dict) else None
+            activation = (activation or "").strip().lower()
+            # Newer checkpoints may apply a bounded activation during training.
+            # Keep inference consistent without breaking older checkpoints.
+            if activation == "tanh":
+                pred_raw = math.tanh(pred_raw)
+
             current = 0.0
             if isinstance(data.features, dict):
                 current = _as_float(data.features.get("price"), 0.0)

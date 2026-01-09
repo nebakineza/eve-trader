@@ -4,7 +4,7 @@ import os
 import glob
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,6 +15,72 @@ from oracle.indicators import add_indicators
 
 
 DEFAULT_PARQUET_URL = "http://192.168.14.105:8001/training_data_cleaned.parquet"
+
+
+# 7D "Liu" feature stack used by the temporal transformer.
+# This matches the order produced by _make_sequences() when macro features are disabled.
+FEATURE_NAMES_7D = [
+    "velocity",
+    "imbalance",
+    "RSI",
+    "MACD",
+    "MACD_Signal",
+    "BB_Upper",
+    "BB_Low",
+]
+
+
+# 8D "Macro" feature stack (Alpha-4 induction): Liu 7D + players_online
+FEATURE_NAMES_8D = FEATURE_NAMES_7D + ["players_online"]
+
+# 9D "Macro" feature stack (Alpha-4 induction): Liu 7D + players_online + warfare_isk_destroyed
+FEATURE_NAMES_9D = FEATURE_NAMES_8D + ["warfare_isk_destroyed"]
+
+# 10D "Macro-Inertia" feature stack: 9D + Demand_Shift
+# Demand_Shift = sum(ISK_Destroyed_60m) / Global_Market_Cap
+FEATURE_NAMES_10D = FEATURE_NAMES_9D + ["demand_shift"]
+
+
+def _parse_created_at(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    s = str(ts).strip()
+    if not s:
+        return None
+    # Our trainer writes created_at like: 20250101T120000Z
+    try:
+        return datetime.strptime(s, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _model_age_hours(path: Path, *, torch_module=None) -> tuple[float | None, str | None]:
+    """Return (age_hours, created_at_str) for an existing checkpoint file."""
+    created_at_str = None
+    created_dt = None
+
+    if torch_module is not None:
+        try:
+            ckpt = torch_module.load(path, map_location="cpu")
+            if isinstance(ckpt, dict):
+                created_at_str = ckpt.get("created_at")
+                created_dt = _parse_created_at(created_at_str)
+        except Exception:
+            created_dt = None
+
+    if created_dt is None:
+        try:
+            mtime = path.stat().st_mtime
+            created_dt = datetime.fromtimestamp(float(mtime), tz=timezone.utc)
+        except Exception:
+            created_dt = None
+
+    if created_dt is None:
+        return None, (str(created_at_str) if created_at_str else None)
+
+    now = datetime.now(tz=timezone.utc)
+    age_hours = (now - created_dt).total_seconds() / 3600.0
+    return float(age_hours), (created_dt.isoformat().replace("+00:00", "Z"))
 
 
 def sync_to_host(*, host: str, dest_dir: str) -> None:
@@ -53,12 +119,25 @@ def sync_to_host(*, host: str, dest_dir: str) -> None:
         print(f"⚠️ Weight sync failed (scp): {e}")
         return
 
-    # Restart strategist on the server to load the new weights
-    # (explicit requirement)
-    remote_restart = "docker restart eve-trader-strategist"
+    # Restart oracle on the server to load the new weights.
+    # Best-effort: do not fail training if Docker permissions/network are missing.
+    remote_restart = "docker restart eve-trader-oracle"
     try:
-        subprocess.run(["ssh", user_host, remote_restart], check=False)
-        print("✅ Triggered remote restart to load new weights")
+        res = subprocess.run(
+            ["ssh", user_host, remote_restart],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if res.returncode == 0:
+            print("✅ Triggered remote restart to load new weights")
+        else:
+            out = (res.stdout or "").strip()
+            if out:
+                print(f"⚠️ Remote restart failed (rc={res.returncode}): {out}")
+            else:
+                print(f"⚠️ Remote restart failed (rc={res.returncode})")
     except Exception as e:
         print(f"⚠️ Remote restart failed: {e}")
 
@@ -213,6 +292,14 @@ def _build_time_series_from_history(df_history: pd.DataFrame, bucket_minutes: in
             "order_book_imbalance" if "order_book_imbalance" in df.columns else price_col,
             "mean",
         ),
+        players_online=(
+            "players_online" if "players_online" in df.columns else price_col,
+            "mean",
+        ),
+        warfare_isk_destroyed=(
+            "warfare_isk_destroyed" if "warfare_isk_destroyed" in df.columns else price_col,
+            "mean",
+        ),
     )
 
     # If we had to use a dummy column for imbalance, normalize to neutral
@@ -221,6 +308,16 @@ def _build_time_series_from_history(df_history: pd.DataFrame, bucket_minutes: in
 
     out["imbalance"] = pd.to_numeric(out["order_book_imbalance"], errors="coerce").fillna(1.0)
 
+    # If we had to use a dummy column for players_online, treat as unknown.
+    if "players_online" not in df.columns:
+        out["players_online"] = 0.0
+    out["players_online"] = pd.to_numeric(out["players_online"], errors="coerce").fillna(0.0)
+
+    # If we had to use a dummy column for warfare_isk_destroyed, treat as unknown.
+    if "warfare_isk_destroyed" not in df.columns:
+        out["warfare_isk_destroyed"] = 0.0
+    out["warfare_isk_destroyed"] = pd.to_numeric(out["warfare_isk_destroyed"], errors="coerce").fillna(0.0)
+
     out = out.sort_values(["type_id", "t"])
     out["velocity"] = out.groupby("type_id")["market_price"].pct_change().replace([np.inf, -np.inf], np.nan)
     out["velocity"] = out["velocity"].fillna(0.0)
@@ -228,7 +325,7 @@ def _build_time_series_from_history(df_history: pd.DataFrame, bucket_minutes: in
     out = add_indicators(out, price_col="market_price", group_col="type_id", time_col="t")
 
     out = out[out["market_price"] > 0]
-    return out[["t", "type_id", "market_price", "imbalance", "velocity", "RSI", "MACD", "MACD_Signal", "BB_Upper", "BB_Low"]]
+    return out[["t", "type_id", "market_price", "imbalance", "velocity", "RSI", "MACD", "MACD_Signal", "BB_Upper", "BB_Low", "players_online", "warfare_isk_destroyed"]]
 
 
 def _make_sequences(
@@ -236,6 +333,8 @@ def _make_sequences(
     lookback_steps: int,
     horizon_steps: int,
     max_samples: int,
+    *,
+    global_market_cap_isk: float,
 ):
     # Output arrays
     x_list = []
@@ -245,6 +344,16 @@ def _make_sequences(
     t_list = []
 
     total = 0
+    # Optional clipping for extreme returns. This stabilizes training when occasional
+    # illiquid spikes create outsized pct_change targets.
+    # Default is wide enough to be a no-op for most 4h horizons.
+    try:
+        return_clip = float(os.getenv("ORACLE_RETURN_CLIP", "1.0"))
+    except Exception:
+        return_clip = 1.0
+    if not (return_clip and return_clip > 0):
+        return_clip = 0.0
+
     for _, g in df_feat.groupby("type_id"):
         g = g.sort_values("t")
         if len(g) < (lookback_steps + horizon_steps + 1):
@@ -261,9 +370,17 @@ def _make_sequences(
         bb_u = pd.to_numeric(g.get("BB_Upper"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
         bb_l = pd.to_numeric(g.get("BB_Low"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
 
+        players_raw = pd.to_numeric(g.get("players_online"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+        warfare_raw = pd.to_numeric(g.get("warfare_isk_destroyed"), errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+
         t = pd.to_datetime(g["t"]).dt
         hours = t.hour.to_numpy(dtype=np.int64)
         days = t.dayofweek.to_numpy(dtype=np.int64)
+
+        global_cap = float(global_market_cap_isk) if global_market_cap_isk and global_market_cap_isk > 0 else 1.0
+        global_cap_log = float(np.log1p(np.float32(max(1.0, global_cap))))
+        if global_cap_log <= 0:
+            global_cap_log = 1.0
 
         for end_idx in range(lookback_steps - 1, len(g) - horizon_steps):
             start_idx = end_idx - lookback_steps + 1
@@ -281,6 +398,22 @@ def _make_sequences(
             bb_u_rel = (bb_u[start_idx : end_idx + 1] / p_safe) - 1.0
             bb_l_rel = (bb_l[start_idx : end_idx + 1] / p_safe) - 1.0
 
+            # Macro feature: scale player count to a stable [0, 1] range.
+            # Using log scaling keeps spikes from dominating.
+            pl = players_raw[start_idx : end_idx + 1]
+            pl = np.where(pl > 0, pl, 0.0)
+            players_scaled = np.log1p(pl) / np.log1p(np.float32(100000.0))
+
+            # Macro feature: total ISK destroyed in last 60 minutes (log-scaled).
+            war = warfare_raw[start_idx : end_idx + 1]
+            war = np.where(war > 0, war, 0.0)
+            war_scale = float(os.getenv("ORACLE_WARFARE_LOG_SCALE_ISK", "10000000000000"))
+            war_scaled = np.log1p(war) / np.log1p(np.float32(max(1.0, war_scale)))
+
+            # Macro-Inertia: Demand_Shift = ISK_Destroyed_60m / Global_Market_Cap
+            # Keep it numerically stable by using a log-ratio mapping into roughly [0,1].
+            demand_shift_scaled = np.log1p(war) / global_cap_log
+
             x = np.stack(
                 [
                     v[start_idx : end_idx + 1],
@@ -290,6 +423,9 @@ def _make_sequences(
                     macd_sig_rel,
                     bb_u_rel,
                     bb_l_rel,
+                    players_scaled,
+                    war_scaled,
+                    demand_shift_scaled,
                 ],
                 axis=1,
             )
@@ -304,6 +440,11 @@ def _make_sequences(
                 y = (p1 - p0) / p0
             else:
                 y = 0.0
+            if return_clip:
+                if y > return_clip:
+                    y = return_clip
+                elif y < -return_clip:
+                    y = -return_clip
             y_list.append(np.float32(y))
             t_list.append(pd.to_datetime(g["t"].iloc[target_idx]))
             total += 1
@@ -401,6 +542,13 @@ def train(cfg: TrainingConfig) -> str:
             raise ValueError("Invalid lookback/horizon for the selected bucket size.")
 
         unique_buckets = int(df_feat["t"].nunique()) if (not df_feat.empty and "t" in df_feat.columns) else 0
+        # Induction-cycle safety gate: require sufficient historical buckets for meaningful
+        # walk-forward validation and stable indicator warmup.
+        min_buckets_gate = int(os.getenv("ORACLE_MIN_BUCKETS", "141"))
+        if min_buckets_gate > 0 and unique_buckets < min_buckets_gate:
+            raise RuntimeError(
+                f"Insufficient time buckets for induction (have {unique_buckets}; need >= {min_buckets_gate})."
+            )
         min_required = lookback_steps + horizon_steps + 1
         if unique_buckets < min_required:
             # Emergency induction mode: allow bootstrapping the training pipeline from a single snapshot.
@@ -427,12 +575,32 @@ def train(cfg: TrainingConfig) -> str:
                 synthetic.append(chunk)
             df_feat = pd.concat(synthetic, ignore_index=True)
 
+        # Macro-Inertia coefficient needs a stable Global Market Cap.
+        # Prefer a live macro value if available; otherwise fall back to env.
+        global_market_cap_isk = None
+        try:
+            cap_raw = r.get("system:macro:global_market_cap")
+            if cap_raw is not None:
+                global_market_cap_isk = float(cap_raw)
+        except Exception:
+            global_market_cap_isk = None
+        if not (global_market_cap_isk and global_market_cap_isk > 0):
+            try:
+                global_market_cap_isk = float(os.getenv("ORACLE_GLOBAL_MARKET_CAP_ISK", "1000000000000000"))
+            except Exception:
+                global_market_cap_isk = 1000000000000000.0
+
         X, H, D, Y, T = _make_sequences(
             df_feat,
             lookback_steps=lookback_steps,
             horizon_steps=horizon_steps,
             max_samples=cfg.max_samples,
+            global_market_cap_isk=float(global_market_cap_isk),
         )
+
+        # Explicitly log the training feature stack so operators can verify
+        # the 7D Liu indicator set is active on the 5090.
+        print(f"Feature stack (input_dim=10): {FEATURE_NAMES_10D}")
 
         # Walk-forward split: first 80% of buckets for train, last 20% for validation.
         unique_ts = np.unique(T)
@@ -463,11 +631,19 @@ def train(cfg: TrainingConfig) -> str:
         train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=False)
         val_dl = DataLoader(val_ds, batch_size=max(64, int(cfg.batch_size)), shuffle=False, drop_last=False)
 
-        model = OracleTemporalTransformer(input_dim=7, forecast_horizon=1).to(device)
+        model = OracleTemporalTransformer(input_dim=10, forecast_horizon=1).to(device)
         model.train()
 
         optim = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
-        loss_fn = torch.nn.MSELoss()
+        # SmoothL1 (Huber) is more robust to occasional target/outlier spikes than MSE.
+        loss_fn = torch.nn.SmoothL1Loss(beta=float(os.getenv("ORACLE_HUBER_BETA", "0.1")))
+
+        # Output activation for return-target models.
+        # We keep this outside the model definition and store it in checkpoint metadata,
+        # so older checkpoints remain compatible.
+        output_activation = (os.getenv("ORACLE_OUTPUT_ACTIVATION_RETURN", "tanh") or "").strip().lower()
+        if output_activation in ("none", "linear", ""):
+            output_activation = ""
 
         last_loss = None
         for epoch in range(cfg.epochs):
@@ -480,6 +656,8 @@ def train(cfg: TrainingConfig) -> str:
                 yb = yb.to(device)
 
                 out = model(xb, hb, db)["predicted_price"]
+                if output_activation == "tanh":
+                    out = torch.tanh(out)
                 loss = loss_fn(out, yb)
 
                 optim.zero_grad(set_to_none=True)
@@ -504,7 +682,10 @@ def train(cfg: TrainingConfig) -> str:
                     xb = xb.to(device)
                     hb = hb.to(device)
                     db = db.to(device)
-                    out = model(xb, hb, db)["predicted_price"].detach().cpu().numpy().reshape(-1)
+                    out_t = model(xb, hb, db)["predicted_price"]
+                    if output_activation == "tanh":
+                        out_t = torch.tanh(out_t)
+                    out = out_t.detach().cpu().numpy().reshape(-1)
                     y = yb.detach().cpu().numpy().reshape(-1)
                     preds.append(out)
                     trues.append(y)
@@ -516,6 +697,54 @@ def train(cfg: TrainingConfig) -> str:
         train_r2 = _r2(y_train, p_train)
         val_r2 = _r2(y_val, p_val)
 
+        # Permutation feature importance on validation set.
+        # We measure importance as the drop in validation R² when a feature is shuffled.
+        feature_importance = None
+        try:
+            baseline_r2 = float(val_r2)
+
+            def _predict_r2_with_permuted_feature(ds: TensorDataset, feat_idx: int) -> float:
+                preds = []
+                trues = []
+                dl = DataLoader(ds, batch_size=2048, shuffle=False, drop_last=False)
+                for xb, hb, db, yb in dl:
+                    # Permute the selected feature across samples in the batch.
+                    xb = xb.clone()
+                    perm = torch.randperm(xb.shape[0])
+                    xb[:, :, feat_idx] = xb[perm, :, feat_idx]
+
+                    xb = xb.to(device)
+                    hb = hb.to(device)
+                    db = db.to(device)
+
+                    out_t = model(xb, hb, db)["predicted_price"]
+                    if output_activation == "tanh":
+                        out_t = torch.tanh(out_t)
+                    out = out_t.detach().cpu().numpy().reshape(-1)
+                    y = yb.detach().cpu().numpy().reshape(-1)
+                    preds.append(out)
+                    trues.append(y)
+                y_all = np.concatenate(trues)
+                p_all = np.concatenate(preds)
+                return _r2(y_all, p_all)
+
+            drops = {}
+            for i, name in enumerate(FEATURE_NAMES_7D):
+                r2_perm = float(_predict_r2_with_permuted_feature(val_ds, i))
+                drops[name] = float(baseline_r2 - r2_perm)
+
+            feature_importance = {
+                "metric": "val_r2_drop_permutation",
+                "baseline_val_r2": float(baseline_r2),
+                "drops": {k: float(v) for k, v in sorted(drops.items(), key=lambda kv: kv[1], reverse=True)},
+            }
+            top = list(feature_importance["drops"].items())[:5]
+            print("Feature importance (val R² drop; higher=more important):")
+            for k, v in top:
+                print(f"  - {k}: {v:+.4f}")
+        except Exception as e:
+            print(f"⚠️ Feature importance skipped: {e}")
+
         # Reject overfit models (walk-forward).
         # Default policy matches the intent:
         # - Reject when training looks very strong but validation collapses (classic overfit)
@@ -525,11 +754,40 @@ def train(cfg: TrainingConfig) -> str:
         strict_train = float(os.getenv("ORACLE_STRICT_TRAIN_R2", "0.95"))
         strict_val = float(os.getenv("ORACLE_STRICT_VAL_R2", "0.2"))
 
+        # Promotion policy: only push to production if validation improves over the
+        # currently-active local latest model (if present).
+        prev_val_r2 = None
+        prev_model_age_hours = None
+        prev_model_created_at = None
+        try:
+            prev_latest = cfg.model_dir / "oracle_v1_latest.pt"
+            if prev_latest.exists():
+                prev_ckpt = torch.load(prev_latest, map_location="cpu")
+                prev_wf = (prev_ckpt or {}).get("walk_forward") or {}
+                if "val_r2" in prev_wf:
+                    prev_val_r2 = float(prev_wf["val_r2"])
+
+                prev_model_age_hours, prev_model_created_at = _model_age_hours(prev_latest, torch_module=torch)
+        except Exception:
+            prev_val_r2 = None
+
+        # Force-Promotion rule: if the current live model is older than 24h,
+        # allow promotion even if validation does not beat prev_val_r2.
+        force_promotion_after_hours = float(os.getenv("ORACLE_FORCE_PROMOTION_AFTER_HOURS", "24"))
+
         accepted = True
+        forced_promotion = False
         reject_reason = None
         if val_r2 < min_val_r2:
             accepted = False
             reject_reason = f"val_r2_below_min (val_r2={val_r2:.3f} < {min_val_r2:.3f})"
+        elif prev_val_r2 is not None and float(val_r2) <= float(prev_val_r2):
+            accepted = False
+            reject_reason = f"val_r2_not_improved (val_r2={val_r2:.3f} <= prev_val_r2={prev_val_r2:.3f})"
+            if prev_model_age_hours is not None and prev_model_age_hours >= force_promotion_after_hours:
+                accepted = True
+                forced_promotion = True
+                reject_reason = None
         elif (train_r2 - val_r2) > max_gap:
             accepted = False
             reject_reason = f"r2_gap_too_large (train_r2={train_r2:.3f}, val_r2={val_r2:.3f}, gap>{max_gap:.3f})"
@@ -544,8 +802,10 @@ def train(cfg: TrainingConfig) -> str:
                 "state_dict": model.state_dict(),
                 "created_at": ts,
                 "device": str(device),
-                "input_dim": 7,
+                "input_dim": 10,
                 "target": "return",
+                "output_activation": (output_activation or "linear"),
+                "return_clip": (float(os.getenv("ORACLE_RETURN_CLIP", "1.0")) if os.getenv("ORACLE_RETURN_CLIP", "") else 1.0),
                 "lookback_minutes": cfg.lookback_minutes,
                 "horizon_minutes": cfg.horizon_minutes,
                 "bucket_minutes": cfg.bucket_minutes,
@@ -553,24 +813,36 @@ def train(cfg: TrainingConfig) -> str:
                     "cutoff_bucket": str(pd.to_datetime(cutoff)),
                     "train_r2": float(train_r2),
                     "val_r2": float(val_r2),
+                    "prev_val_r2": (float(prev_val_r2) if prev_val_r2 is not None else None),
+                    "prev_model_age_hours": (float(prev_model_age_hours) if prev_model_age_hours is not None else None),
+                    "prev_model_created_at": prev_model_created_at,
                     "accepted": bool(accepted),
+                    "forced_promotion": bool(forced_promotion),
                     "reject_reason": reject_reason,
                     "min_val_r2": float(min_val_r2),
                     "max_r2_gap": float(max_gap),
+                },
+                "features": {
+                    "names": FEATURE_NAMES_10D,
+                    "importance": feature_importance,
+                    "global_market_cap_isk": float(global_market_cap_isk),
                 },
             },
             model_path,
         )
 
         # Maintain a stable "latest" handle for continuous training.
+        # Only update this pointer when the model is accepted, so inference and
+        # subsequent promotions don't accidentally anchor on rejected weights.
         latest_path = cfg.model_dir / "oracle_v1_latest.pt"
-        try:
-            tmp_latest = cfg.model_dir / f"oracle_v1_latest_{ts}.pt.tmp"
-            tmp_latest.write_bytes(model_path.read_bytes())
-            tmp_latest.replace(latest_path)
-        except Exception:
-            # Best-effort; the versioned model is the source of truth.
-            pass
+        if accepted:
+            try:
+                tmp_latest = cfg.model_dir / f"oracle_v1_latest_{ts}.pt.tmp"
+                tmp_latest.write_bytes(model_path.read_bytes())
+                tmp_latest.replace(latest_path)
+            except Exception:
+                # Best-effort; the versioned model is the source of truth.
+                pass
 
         # Only publish models that pass validation.
         if accepted:
@@ -585,6 +857,7 @@ def train(cfg: TrainingConfig) -> str:
             "gpu_name": gpu_name,
             "gpu_capability": gpu_capability,
             "gpu_warning": gpu_warning,
+            "global_market_cap_isk": float(global_market_cap_isk),
             "samples": int(len(train_ds) + len(val_ds)),
             "rows_in_parquet": int(len(df_orders)),
             "model_path": str(model_path),
@@ -596,9 +869,16 @@ def train(cfg: TrainingConfig) -> str:
             "val_samples": int(len(val_ds)),
             "train_r2": float(train_r2),
             "val_r2": float(val_r2),
+            "prev_val_r2": (float(prev_val_r2) if prev_val_r2 is not None else None),
+            "prev_model_age_hours": (float(prev_model_age_hours) if prev_model_age_hours is not None else None),
+            "forced_promotion": bool(forced_promotion),
             "accepted": bool(accepted),
             "reject_reason": reject_reason,
             "target": "return",
+            "features": {
+                "names": FEATURE_NAMES_10D,
+                "importance": feature_importance,
+            },
         }
         r.set("oracle:last_training_metrics", json.dumps(metrics))
         r.set("oracle:model_latest_path", str(model_path))

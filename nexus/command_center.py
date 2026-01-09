@@ -10,7 +10,7 @@ import os
 import requests
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import sqlalchemy
 from sqlalchemy import text
 from streamlit_autorefresh import st_autorefresh
@@ -58,7 +58,191 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st_autorefresh(interval=60 * 1000, key="datarefresh")
+refresh_tick = st_autorefresh(interval=60 * 1000, key="datarefresh")
+
+# Quick operator-visible confirmation of refresh cadence.
+try:
+    st.sidebar.caption(f"Refresh tick: {int(refresh_tick)}")
+except Exception:
+    pass
+
+
+@st.cache_data(ttl=300)
+def get_hypertable_sizes_df() -> pd.DataFrame:
+    if not db_engine:
+        return pd.DataFrame(columns=["table", "bytes", "size"])
+    try:
+        with db_engine.connect() as conn:
+            df = pd.read_sql(
+                text(
+                    """
+                    SELECT
+                        relname AS table,
+                        pg_total_relation_size(relid) AS bytes,
+                        pg_size_pretty(pg_total_relation_size(relid)) AS size
+                    FROM pg_catalog.pg_statio_user_tables
+                    WHERE relname IN ('market_orders','market_history','shadow_trades','pending_trades')
+                    ORDER BY bytes DESC
+                    """
+                ),
+                conn,
+            )
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["table", "bytes", "size"])
+
+
+@st.cache_data(ttl=300)
+def get_shadow_trade_outcomes_df(limit: int = 100, horizon_minutes: int = 60, fee_rate: float = 0.025) -> pd.DataFrame:
+    if not db_engine:
+        return pd.DataFrame()
+
+    # Ensure schema exists before selecting optional columns.
+    try:
+        ddl_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage", "shadow_ledger.sql")
+        with open(ddl_path, "r", encoding="utf-8") as f:
+            ddl = f.read()
+        with db_engine.begin() as conn:
+            for stmt in ddl.split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    conn.execute(text(stmt))
+    except Exception:
+        pass
+
+    with db_engine.connect() as conn:
+        return pd.read_sql(
+            text(
+                """
+                SELECT
+                    t.type_id,
+                    t.signal_type,
+                    t.actual_price_at_time AS entry_price,
+                    mh.close AS exit_price,
+                    t.reasoning,
+                    t.timestamp
+                FROM shadow_trades t
+                LEFT JOIN LATERAL (
+                    SELECT close
+                    FROM market_history
+                    WHERE type_id = t.type_id
+                      AND timestamp >= t.timestamp + (:horizon || ' minutes')::interval
+                    ORDER BY timestamp ASC
+                    LIMIT 1
+                ) mh ON TRUE
+                ORDER BY t.timestamp DESC
+                LIMIT :limit
+                """
+            ),
+            conn,
+            params={"limit": int(limit), "horizon": int(horizon_minutes)},
+        )
+
+
+@st.cache_data(ttl=300)
+def get_item_roi_df(limit: int = 5, horizon_minutes: int = 60, fee_rate: float = 0.025) -> pd.DataFrame:
+    if not db_engine:
+        return pd.DataFrame()
+    with db_engine.connect() as conn:
+        return pd.read_sql(
+            text(
+                """
+                WITH base AS (
+                    SELECT
+                        t.type_id,
+                        t.signal_type,
+                        t.actual_price_at_time AS entry_price,
+                        mh.close AS exit_price
+                    FROM shadow_trades t
+                    LEFT JOIN LATERAL (
+                        SELECT close
+                        FROM market_history
+                        WHERE type_id = t.type_id
+                          AND timestamp >= t.timestamp + (:horizon || ' minutes')::interval
+                        ORDER BY timestamp ASC
+                        LIMIT 1
+                    ) mh ON TRUE
+                    WHERE t.virtual_outcome IN ('WIN','LOSS')
+                      AND t.actual_price_at_time IS NOT NULL
+                ), scored AS (
+                    SELECT
+                        type_id,
+                        entry_price,
+                        CASE
+                            WHEN exit_price IS NULL OR entry_price <= 0 OR exit_price <= 0 THEN NULL
+                            WHEN UPPER(signal_type) = 'BUY' THEN (exit_price - entry_price)
+                            ELSE (entry_price - exit_price)
+                        END AS gross_isk
+                    FROM base
+                )
+                SELECT
+                    type_id,
+                    COUNT(*)::bigint AS trade_count,
+                    COALESCE(SUM(CASE WHEN gross_isk IS NULL THEN 0 ELSE gross_isk END) * (1 - :fee), 0) AS net_profit,
+                    CASE
+                        WHEN SUM(CASE WHEN entry_price IS NULL OR entry_price <= 0 THEN 0 ELSE entry_price END) <= 0 THEN 0
+                        ELSE (COALESCE(SUM(CASE WHEN gross_isk IS NULL THEN 0 ELSE gross_isk END) * (1 - :fee), 0)
+                              / SUM(CASE WHEN entry_price IS NULL OR entry_price <= 0 THEN 0 ELSE entry_price END))
+                    END AS net_roi
+                FROM scored
+                GROUP BY type_id
+                ORDER BY net_roi DESC
+                LIMIT :limit
+                """
+            ),
+            conn,
+            params={"limit": int(limit), "horizon": int(horizon_minutes), "fee": float(fee_rate)},
+        )
+
+
+@st.cache_data(ttl=300)
+def get_trade_volume_by_hour_utc_df(lookback_hours: int = 24 * 7) -> pd.DataFrame:
+    if not db_engine:
+        return pd.DataFrame(columns=["hour_utc", "trade_count"])
+    lookback_hours = max(1, int(lookback_hours))
+    with db_engine.connect() as conn:
+        df = pd.read_sql(
+            text(
+                """
+                SELECT
+                    EXTRACT(hour FROM (timestamp AT TIME ZONE 'UTC'))::int AS hour_utc,
+                    COUNT(*)::bigint AS trade_count
+                FROM shadow_trades
+                WHERE timestamp >= NOW() - (:hours || ' hours')::interval
+                GROUP BY 1
+                ORDER BY 1
+                """
+            ),
+            conn,
+            params={"hours": int(lookback_hours)},
+        )
+
+    # Ensure 0..23 present for a stable histogram.
+    if df.empty:
+        return pd.DataFrame({"hour_utc": list(range(24)), "trade_count": [0] * 24})
+    all_hours = pd.DataFrame({"hour_utc": list(range(24))})
+    df2 = all_hours.merge(df, on="hour_utc", how="left").fillna({"trade_count": 0})
+    df2["trade_count"] = df2["trade_count"].astype(int)
+    return df2
+
+
+def _safe_redis_keys(redis_client, pattern: str, limit: int = 200):
+    """Avoid Redis KEYS (blocking). Return up to `limit` keys via SCAN."""
+    if redis_client is None:
+        return []
+    try:
+        limit = max(1, int(limit))
+    except Exception:
+        limit = 200
+    out = []
+    try:
+        for k in redis_client.scan_iter(match=pattern, count=min(1000, limit)):
+            out.append(k)
+            if len(out) >= limit:
+                break
+    except Exception:
+        return []
+    return out
 
 # --- Local/Remote Log Helpers ---
 def _tail_text_file(path: str, lines: int = 3, max_bytes: int = 64 * 1024) -> str:
@@ -486,14 +670,32 @@ with tab_oracle:
     st.markdown("### 🧠 Oracle Insight")
 
     # Model Path & Validation R²
-    model_path_used = "models/oracle_v1_latest.pt"  # default for oracle container
+    model_path_used = "models/oracle_v1_latest.pt"  # default / fallback
     if r:
         try:
-            from_redis = r.get("oracle:model_path")
-            if from_redis:
-                model_path_used = str(from_redis)
+            # Support multiple key names used by different pipeline versions.
+            for k in (
+                "oracle:model_latest_path",
+                "oracle:model_latest_path_5090",
+                "oracle:model_path",
+            ):
+                from_redis = r.get(k)
+                if from_redis:
+                    model_path_used = str(from_redis)
+                    break
         except Exception:
             pass
+
+    # If the local synced artifact exists, prefer showing it.
+    try:
+        from pathlib import Path
+
+        root_dir = Path(__file__).resolve().parents[1]
+        local_pt = root_dir / "models" / "oracle_v1_latest.pt"
+        if local_pt.exists():
+            model_path_used = str(local_pt)
+    except Exception:
+        pass
 
     val_r2 = 0.0
     train_r2 = 0.0
@@ -503,31 +705,54 @@ with tab_oracle:
             metrics_raw = r.get("oracle:last_training_metrics")
             if metrics_raw:
                 metrics = json.loads(metrics_raw)
-                val_r2 = float(metrics.get("val_r2", 0.0) or 0.0)
-                train_r2 = float(metrics.get("train_r2", 0.0) or 0.0)
-                reject_reason = metrics.get("reject_reason")
+                if isinstance(metrics, dict):
+                    # Direct fields (on successful training runs)
+                    val_r2 = float(metrics.get("val_r2", 0.0) or 0.0)
+                    train_r2 = float(metrics.get("train_r2", 0.0) or 0.0)
+                    reject_reason = metrics.get("reject_reason")
+
+                    # On reject paths, val_r2/prev_val_r2 may only appear in the error string.
+                    err = metrics.get("error")
+                    if isinstance(err, str):
+                        if not reject_reason and ":" in err:
+                            tail = err.split(":", 1)[1].strip()
+                            reject_reason = tail.split("(", 1)[0].strip() if tail else None
+                        if (val_r2 or 0.0) <= 0.0:
+                            m = re.search(r"\bval_r2=([0-9]*\.?[0-9]+)", err)
+                            if m:
+                                try:
+                                    val_r2 = float(m.group(1))
+                                except Exception:
+                                    pass
         except Exception:
             pass
 
     # Next training session countdown (based on 4h cron schedule)
     next_training_eta = "N/A"
-    if r:
-        try:
-            last_train_ts_raw = r.get("oracle:last_training_ts")
-            if last_train_ts_raw:
-                last_ts = float(last_train_ts_raw)
-                next_ts = last_ts + (4 * 3600)
-                remaining_s = max(0, next_ts - time.time())
-                h = int(remaining_s // 3600)
-                m = int((remaining_s % 3600) // 60)
-                next_training_eta = f"{h}h {m}m"
-        except Exception:
-            pass
+    try:
+        now_utc = datetime.now(tz=timezone.utc)
+        # Next boundary at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+        add_hours = 4 - (int(now_utc.hour) % 4)
+        if add_hours == 0 and (now_utc.minute > 0 or now_utc.second > 0):
+            add_hours = 4
+        next_train = now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=int(add_hours))
+        remaining_s = max(0, int((next_train - now_utc).total_seconds()))
+        h = remaining_s // 3600
+        m = (remaining_s % 3600) // 60
+        next_training_eta = f"{h}h {m}m"
+    except Exception:
+        next_training_eta = "N/A"
 
     c_m1, c_m2, c_m3 = st.columns(3)
     c_m1.metric("Model Path", model_path_used.split("/")[-1])
     c_m2.metric("Validation R²", f"{val_r2:.4f}")
     c_m3.metric("Next Training", next_training_eta)
+
+    # Show full model path for operator debugging.
+    try:
+        st.caption(f"Model Path (full): {model_path_used}")
+    except Exception:
+        pass
 
     if reject_reason:
         st.warning(f"🚫 Last Induction Rejected: {reject_reason}")
@@ -634,11 +859,11 @@ with tab_fundamentals:
 
     if warfare_source:
         if str(warfare_source).strip().lower() != "kongyo2_osint_mcp":
-            st.warning(f"OSINT feed is not MCP-backed (source={warfare_source}).")
+            st.caption(f"OSINT feed source: {warfare_source} (non-MCP).")
         else:
             st.caption(f"OSINT source: {warfare_source}")
     else:
-        st.warning("OSINT feed source unknown (missing system:macro:warfare:source).")
+        st.caption("OSINT feed source unknown (missing system:macro:warfare:source).")
 
     if warfare_age_s is not None:
         st.caption(f"War feed age: {warfare_age_s:.0f}s")
@@ -743,6 +968,9 @@ with tab_fundamentals:
     st.subheader("Oracle Model Status")
     model_status = "UNKNOWN"
     last_metrics = None
+    reject_reason = None
+    last_train_error = None
+    last_train_ts = None
     if r:
         try:
             model_status = r.get("oracle:model_status") or "IDLE"
@@ -751,6 +979,32 @@ with tab_fundamentals:
                 last_metrics = json.loads(metrics_raw)
         except Exception as e:
             st.error(f"Oracle status read error: {e}")
+
+    if isinstance(last_metrics, dict):
+        try:
+            last_train_error = last_metrics.get("error")
+            last_train_ts = last_metrics.get("timestamp")
+            if isinstance(last_train_error, str) and ":" in last_train_error:
+                # Example: "Model rejected by validation: val_r2_not_improved (val_r2=... <= prev_val_r2=...)"
+                tail = last_train_error.split(":", 1)[1].strip()
+                reject_reason = tail.split("(", 1)[0].strip() if tail else None
+        except Exception:
+            reject_reason = None
+
+    # Model artifact timestamp (synced from 5090 host by cron_train.sh)
+    model_mtime_utc = None
+    model_age_s = None
+    try:
+        from pathlib import Path
+
+        root_dir = Path(__file__).resolve().parents[1]
+        pt_path = root_dir / "models" / "oracle_v1_latest.pt"
+        if pt_path.exists():
+            model_mtime_utc = datetime.fromtimestamp(pt_path.stat().st_mtime, tz=timezone.utc)
+            model_age_s = max(0.0, (datetime.now(tz=timezone.utc) - model_mtime_utc).total_seconds())
+    except Exception:
+        model_mtime_utc = None
+        model_age_s = None
 
     # 5090 telemetry + model precision (requested in Oracle tab)
     skynet_temp = None
@@ -809,6 +1063,32 @@ with tab_fundamentals:
     c3.metric("🔥 5090 Temp", f"{skynet_temp}°C" if skynet_temp is not None else "N/A")
     c4.metric("Confidence", f"{latest_conf:.2f}")
     c5.metric("📈 Model Maturity", f"{maturity_pct:.1f}%")
+
+    # Reject reason + next training timer (4-hour cron cadence)
+    try:
+        now_utc = datetime.now(tz=timezone.utc)
+        hours_mod = int(now_utc.hour) % 4
+        add_hours = 4 - hours_mod
+        if add_hours == 0 and (now_utc.minute > 0 or now_utc.second > 0):
+            add_hours = 4
+        next_train = (now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=add_hours))
+        delta_s = max(0, int((next_train - now_utc).total_seconds()))
+        hh = delta_s // 3600
+        mm = (delta_s % 3600) // 60
+        countdown = f"{hh}h {mm}m"
+    except Exception:
+        countdown = "N/A"
+
+    rr = reject_reason or ("OK" if str(model_status).upper() in {"LIVE", "OK"} else "UNKNOWN")
+    st.caption(f"Reject reason: {rr}")
+    if last_train_ts:
+        st.caption(f"Last training attempt: {last_train_ts}")
+    if last_train_error and reject_reason:
+        st.caption(f"Last reject: {last_train_error}")
+    st.caption(f"Next training (4h cadence, UTC): in {countdown}")
+
+    if model_mtime_utc is not None:
+        st.caption(f"Latest model artifact: {model_mtime_utc.isoformat()} (age {int(model_age_s or 0)}s)")
 
     # Mean Reversion Potential indicator (BB_Upper dominance detected)
     bb_upper_impact = 0.0
@@ -946,34 +1226,68 @@ with tab_performance:
     # Trade Performance Table (color-coded)
     if db_engine:
         try:
-            with db_engine.connect() as conn:
-                perf_df = pd.read_sql(
-                    text("""
-                        SELECT
-                            type_id,
-                            signal_type,
-                            virtual_outcome,
-                            actual_price_at_time AS entry_price,
-                            timestamp
-                        FROM shadow_trades
-                        WHERE virtual_outcome IN ('WIN', 'LOSS')
-                        ORDER BY timestamp DESC
-                        LIMIT 100
-                    """),
-                    conn,
-                )
+            perf_df = get_shadow_trade_outcomes_df(limit=100, horizon_minutes=60, fee_rate=0.025)
 
             if not perf_df.empty:
-                def _color_outcome(val):
-                    if val == "WIN":
-                        return "background-color: #28a745; color: white"
-                    elif val == "LOSS":
-                        return "background-color: #dc3545; color: white"
-                    return ""
+                # Compute realized profit + status for coloring.
+                dfp = perf_df.copy()
+                dfp["entry_price"] = pd.to_numeric(dfp.get("entry_price"), errors="coerce")
+                dfp["exit_price"] = pd.to_numeric(dfp.get("exit_price"), errors="coerce")
+
+                def _profit_net(row):
+                    ep = row.get("entry_price")
+                    xp = row.get("exit_price")
+                    if ep is None or xp is None or pd.isna(ep) or pd.isna(xp) or float(ep) <= 0:
+                        return np.nan
+                    if str(row.get("signal_type", "")).upper() == "BUY":
+                        gross = float(xp) - float(ep)
+                    else:
+                        gross = float(ep) - float(xp)
+                    return gross * (1.0 - 0.025)
+
+                dfp["profit_net"] = dfp.apply(_profit_net, axis=1)
+                dfp["status"] = dfp["profit_net"].apply(
+                    lambda v: "PENDING" if pd.isna(v) else ("WIN" if float(v) > 0 else "LOSS")
+                )
+
+                def _color_profit(v):
+                    if v is None or pd.isna(v):
+                        return "background-color: #6c757d; color: white"  # PENDING
+                    return "background-color: #28a745; color: white" if float(v) > 0 else "background-color: #dc3545; color: white"
 
                 st.subheader("Recent Trade Performance")
-                styled = perf_df.style.applymap(_color_outcome, subset=["virtual_outcome"])
+                show_cols = [c for c in ["timestamp", "type_id", "signal_type", "entry_price", "exit_price", "profit_net", "status"] if c in dfp.columns]
+                styled = dfp[show_cols].style.applymap(_color_profit, subset=["profit_net"])
                 st.dataframe(styled, use_container_width=True, height=300)
+
+                # Winner's Ledger: per-trade reasoning + outcome color.
+                st.subheader("Winner's Ledger")
+                try:
+                    # Resolve item names
+                    type_ids = [int(x) for x in dfp["type_id"].dropna().astype(int).tolist()]
+                    type_names = resolve_type_names(type_ids)
+                    ledger = dfp.copy()
+                    ledger["item_name"] = ledger["type_id"].apply(lambda x: type_names.get(str(int(x)), f"Type {int(x)}") if pd.notna(x) else "Unknown")
+                    ledger["reasoning"] = ledger.get("reasoning")
+
+                    # Only show resolved outcomes in the ledger.
+                    resolved = ledger[ledger["status"].isin(["WIN", "LOSS"])].copy()
+                    resolved["outcome"] = resolved["status"].apply(lambda s: "GREEN" if str(s).upper() == "WIN" else "RED")
+
+                    def _color_outcome(v):
+                        s = str(v or "").upper()
+                        if s == "GREEN":
+                            return "background-color: #28a745; color: white"
+                        if s == "RED":
+                            return "background-color: #dc3545; color: white"
+                        return ""
+
+                    show = resolved[["timestamp", "item_name", "reasoning", "outcome"]].head(100)
+                    st.dataframe(show.style.applymap(_color_outcome, subset=["outcome"]), use_container_width=True, height=260)
+                except Exception as e:
+                    st.error(f"Winner's Ledger error: {e}")
+            else:
+                st.info("No shadow trades recorded yet.")
         except Exception as e:
             st.error(f"Trade performance table error: {e}")
 
@@ -982,59 +1296,49 @@ with tab_performance:
     # Item ROI Bar Chart
     if db_engine:
         try:
-            with db_engine.connect() as conn:
-                roi_df = pd.read_sql(
-                    text("""
-                        SELECT
-                            t.type_id,
-                            COUNT(*) AS trade_count,
-                            SUM(
-                                CASE
-                                    WHEN t.virtual_outcome = 'WIN' AND mh.close IS NOT NULL THEN
-                                        CASE
-                                            WHEN t.signal_type = 'BUY' THEN (mh.close - t.actual_price_at_time)
-                                            ELSE (t.actual_price_at_time - mh.close)
-                                        END
-                                    ELSE 0
-                                END
-                            ) AS net_profit
-                        FROM shadow_trades t
-                        LEFT JOIN LATERAL (
-                            SELECT close
-                            FROM market_history
-                            WHERE type_id = t.type_id
-                              AND timestamp >= t.timestamp + INTERVAL '60 minutes'
-                            ORDER BY timestamp ASC
-                            LIMIT 1
-                        ) mh ON TRUE
-                        WHERE t.virtual_outcome IN ('WIN', 'LOSS')
-                        GROUP BY t.type_id
-                        ORDER BY net_profit DESC
-                        LIMIT 20
-                    """),
-                    conn,
-                )
+            roi_df = get_item_roi_df(limit=5, horizon_minutes=60, fee_rate=0.025)
 
             if not roi_df.empty:
-                st.subheader("Top 20 Items by Net Profit (ROI)")
+                st.subheader("Top 5 Items by Net ROI")
                 type_names = resolve_type_names(roi_df["type_id"].tolist())
                 roi_df["item_name"] = roi_df["type_id"].apply(lambda x: type_names.get(str(x), f"Type {x}"))
-                fig_roi = go.Figure(
-                    go.Bar(
-                        x=roi_df["net_profit"],
-                        y=roi_df["item_name"],
-                        orientation="h",
-                        marker=dict(
-                            color=roi_df["net_profit"],
-                            colorscale="RdYlGn",
-                            showscale=True,
-                        ),
-                    )
+                roi_df["net_roi"] = (
+                    pd.to_numeric(roi_df.get("net_roi"), errors="coerce")
+                    .replace([np.inf, -np.inf], np.nan)
+                    .fillna(0.0)
                 )
-                fig_roi.update_layout(title="Item ROI", xaxis_title="Net Profit (ISK)", yaxis_title="Item")
-                st.plotly_chart(fig_roi, use_container_width=True)
+                roi_chart = (
+                    roi_df[["item_name", "net_roi"]]
+                    .set_index("item_name")
+                    .sort_values("net_roi", ascending=False)
+                )
+                st.bar_chart(roi_chart, height=260)
         except Exception as e:
             st.error(f"Item ROI chart error: {e}")
+
+    st.divider()
+
+    # Timezone Audit: trade volume per hour (UTC)
+    if db_engine:
+        try:
+            tz_df = get_trade_volume_by_hour_utc_df(lookback_hours=int(os.getenv("AUDIT_TZ_LOOKBACK_HOURS", str(24 * 7))))
+            st.subheader("Timezone Audit: Trade Volume by Hour (UTC)")
+            fig_tz = go.Figure(
+                go.Bar(
+                    x=tz_df["hour_utc"].astype(int),
+                    y=tz_df["trade_count"].astype(int),
+                    name="Trades",
+                )
+            )
+            fig_tz.update_layout(
+                xaxis_title="Hour (UTC)",
+                yaxis_title="Trades",
+                height=280,
+                margin=dict(l=10, r=10, t=40, b=10),
+            )
+            st.plotly_chart(fig_tz, use_container_width=True)
+        except Exception as e:
+            st.error(f"Timezone audit error: {e}")
 
     st.divider()
 
@@ -1117,55 +1421,54 @@ with tab_performance:
         wins = 0
         resolved = 0
         total_alpha = 0.0
+        lookback_days = 7
 
         try:
             with db_engine.connect() as conn:
-                # Win rate is computed over resolved outcomes (WIN+LOSS).
+                # Compute 7d metrics from realized horizon prices (independent of stored virtual_outcome).
+                # This avoids historical mislabeling/forced-exit artifacts and prevents inflated alpha.
                 row = conn.execute(
                     text(
                         """
-                        SELECT
-                            SUM(CASE WHEN virtual_outcome = 'WIN' THEN 1 ELSE 0 END) AS wins,
-                            SUM(CASE WHEN virtual_outcome IN ('WIN','LOSS') THEN 1 ELSE 0 END) AS resolved
-                        FROM shadow_trades
-                        """
-                    )
-                ).fetchone()
-
-                wins = int(row[0] or 0)
-                resolved = int(row[1] or 0)
-
-                alpha_row = conn.execute(
-                    text(
-                        """
-                        SELECT COALESCE(
-                            SUM(
+                        WITH base AS (
+                            SELECT
+                                t.timestamp,
+                                t.signal_type,
+                                t.actual_price_at_time AS entry_price,
+                                mh.close AS exit_price
+                            FROM shadow_trades t
+                            LEFT JOIN LATERAL (
+                                SELECT close
+                                FROM market_history
+                                WHERE type_id = t.type_id
+                                  AND timestamp >= t.timestamp + (:horizon || ' minutes')::interval
+                                ORDER BY timestamp ASC
+                                LIMIT 1
+                            ) mh ON TRUE
+                            WHERE t.timestamp >= NOW() - (:days || ' days')::interval
+                              AND t.actual_price_at_time IS NOT NULL
+                        ), scored AS (
+                            SELECT
                                 CASE
-                                    WHEN t.virtual_outcome = 'WIN' AND mh.close IS NOT NULL THEN
-                                        CASE
-                                            WHEN t.signal_type = 'BUY' THEN (mh.close - t.actual_price_at_time)
-                                            ELSE (t.actual_price_at_time - mh.close)
-                                        END
-                                    ELSE 0
-                                END
-                            ) * (1 - :fee),
-                            0
-                        ) AS total_alpha
-                        FROM shadow_trades t
-                        LEFT JOIN LATERAL (
-                            SELECT close
-                            FROM market_history
-                            WHERE type_id = t.type_id
-                              AND timestamp >= t.timestamp + (:horizon || ' minutes')::interval
-                            ORDER BY timestamp ASC
-                            LIMIT 1
-                        ) mh ON TRUE
+                                    WHEN exit_price IS NULL OR entry_price <= 0 OR exit_price <= 0 THEN NULL
+                                    WHEN UPPER(signal_type) = 'BUY' THEN (exit_price - entry_price)
+                                    ELSE (entry_price - exit_price)
+                                END AS gross_isk
+                            FROM base
+                        )
+                        SELECT
+                            SUM(CASE WHEN gross_isk IS NOT NULL AND gross_isk > 0 THEN 1 ELSE 0 END) AS wins,
+                            SUM(CASE WHEN gross_isk IS NOT NULL THEN 1 ELSE 0 END) AS resolved,
+                            COALESCE(SUM(CASE WHEN gross_isk IS NULL THEN 0 ELSE gross_isk END) * (1 - :fee), 0) AS total_alpha
+                        FROM scored
                         """
                     ),
-                    {"fee": float(fee_rate), "horizon": int(horizon_minutes)},
+                    {"fee": float(fee_rate), "horizon": int(horizon_minutes), "days": int(lookback_days)},
                 ).fetchone()
 
-                total_alpha = float(alpha_row[0] or 0.0)
+                wins = int((row[0] or 0) if row else 0)
+                resolved = int((row[1] or 0) if row else 0)
+                total_alpha = float((row[2] or 0.0) if row else 0.0)
 
         except Exception as e:
             st.error(f"Performance query error: {e}")
@@ -1174,21 +1477,21 @@ with tab_performance:
         c1, c2 = st.columns(2)
         c1.metric("Total Virtual Alpha (7d, net)", f"{total_alpha:,.2f}")
         c2.metric("Win Rate % (resolved)", f"{win_rate:.1f}%")
+        st.caption(f"Window: last {lookback_days}d, horizon={horizon_minutes}m, fee={fee_rate:.3f}")
 
         st.divider()
 
         # --- Sharpe Ratio Audit ---
         try:
             with db_engine.connect() as conn:
-                # Fetch last 100 resolved trades to compute Sharpe
+                # Fetch last 100 matured trades (horizon price available) to compute Sharpe.
                 sharpe_df = pd.read_sql(
                     text(
                         """
                         SELECT
                             t.actual_price_at_time as entry_price,
                             mh.close as exit_price,
-                            t.signal_type,
-                            t.forced_exit
+                            t.signal_type
                         FROM shadow_trades t
                         LEFT JOIN LATERAL (
                             SELECT close
@@ -1198,7 +1501,9 @@ with tab_performance:
                             ORDER BY timestamp ASC
                             LIMIT 1
                         ) mh ON TRUE
-                        WHERE t.virtual_outcome IN ('WIN', 'LOSS')
+                        WHERE t.timestamp <= NOW() - (:horizon || ' minutes')::interval
+                          AND mh.close IS NOT NULL
+                          AND t.actual_price_at_time IS NOT NULL
                         ORDER BY t.timestamp DESC
                         LIMIT 100
                         """
@@ -1210,55 +1515,32 @@ with tab_performance:
             if not sharpe_df.empty:
                 # Calculate simple returns
                 def calc_return(row):
-                    if row['forced_exit']:
-                        # Stop-loss can widen during high-volatility warfare events.
-                        try:
-                            warfare_isk = float(r.get("system:macro:warfare") or 0.0)
-                        except Exception:
-                            warfare_isk = 0.0
-
-                        try:
-                            warfare_threshold = float(os.getenv("SHADOW_WARFARE_THRESHOLD_ISK", "0"))
-                        except Exception:
-                            warfare_threshold = 0.0
-
-                        stop_loss_pct = 0.015
-                        try:
-                            stop_loss_pct = float(os.getenv("SHADOW_STOP_LOSS_PCT", "0.015"))
-                        except Exception:
-                            stop_loss_pct = 0.015
-
-                        if warfare_threshold > 0 and warfare_isk > warfare_threshold:
-                            try:
-                                stop_loss_pct = float(os.getenv("SHADOW_WAR_STOP_LOSS_PCT", "0.03"))
-                            except Exception:
-                                stop_loss_pct = 0.03
-
-                        return -abs(float(stop_loss_pct))
-                    
                     if row['entry_price'] == 0 or pd.isna(row['exit_price']):
-                        return 0.0
-                    
-                    if row['signal_type'] == 'BUY':
+                        return np.nan
+
+                    if str(row['signal_type']).upper() == 'BUY':
                         return (row['exit_price'] - row['entry_price']) / row['entry_price']
                     else:
                         return (row['entry_price'] - row['exit_price']) / row['entry_price']
 
                 sharpe_df['ret'] = sharpe_df.apply(calc_return, axis=1)
+                sharpe_df = sharpe_df.dropna(subset=['ret'])
 
                 # Bardol winsorization clamp to stabilize Sharpe audit.
                 sharpe_df['ret'] = sharpe_df['ret'].clip(lower=-1.0, upper=10.0)
                 
-                rp = sharpe_df['ret'].mean()
-                sigma_p = sharpe_df['ret'].std()
-                
-                sharpe = (rp / sigma_p) if sigma_p > 0 else 0.0
+                rp = float(sharpe_df['ret'].mean())
+                sigma_p = float(sharpe_df['ret'].std())
+
+                sharpe = None
+                if sigma_p and sigma_p > 0 and np.isfinite(sigma_p):
+                    sharpe = (rp / sigma_p)
                 
                 st.subheader("Risk Audit (Last 100 Trades)")
                 c_s1, c_s2, c_s3 = st.columns(3)
-                c_s1.metric("Sharpe Ratio", f"{sharpe:.4f}")
+                c_s1.metric("Sharpe Ratio", f"{sharpe:.4f}" if sharpe is not None else "N/A")
                 c_s2.metric("Exp. Return", f"{rp*100:.3f}%")
-                c_s3.metric("Volatility (σ)", f"{sigma_p*100:.3f}%")
+                c_s3.metric("Volatility (σ)", f"{sigma_p*100:.3f}%" if sigma_p and np.isfinite(sigma_p) else "N/A")
                 st.caption(f"Based on {len(sharpe_df)} resolved trades. (Rf=0)")
                 st.divider()
 
@@ -1392,6 +1674,37 @@ with tab_system:
         render_eve_client_sync_status()
         
         st.markdown("**Visual Verification (Live Frame):**")
+        st.caption("To engage the physical execution layer, set HARDWARE_LOCK to OFF (UNLOCKED/armed) in the sidebar.")
+
+        if r:
+            try:
+                shot_b64 = r.get("system:zombie:screenshot")
+            except Exception:
+                shot_b64 = None
+        else:
+            shot_b64 = None
+
+        if shot_b64:
+            try:
+                import base64
+
+                img_bytes = base64.b64decode(shot_b64)
+                try:
+                    st.image(
+                        img_bytes,
+                        caption="EVE client frame",
+                        use_container_width=True,
+                    )
+                except TypeError:
+                    st.image(
+                        img_bytes,
+                        caption="EVE client frame",
+                        use_column_width=True,
+                    )
+            except Exception as e:
+                st.warning(f"Screenshot decode failed: {e}")
+        else:
+            st.info("No screenshot yet. Expect updates every ~60s once ZombieShot is running on the host.")
 
         st.markdown("**📜 Accept EULA**")
         if r:
@@ -1443,14 +1756,6 @@ with tab_system:
         else:
             st.info("OTP injection unavailable (Redis not connected).")
 
-        if r:
-            try:
-                shot_b64 = r.get("system:zombie:screenshot")
-            except Exception:
-                shot_b64 = None
-        else:
-            shot_b64 = None
-
         # --- Client state indicator (AUTO-ZOMBIE flip) ---
         client_state = None
         window_title = None
@@ -1475,29 +1780,7 @@ with tab_system:
         if scanned_at:
             st.caption(f"Scanned: {scanned_at}")
 
-        if shot_b64:
-            try:
-                import base64
-
-                img_bytes = base64.b64decode(shot_b64)
-
-                # Fallback for older Streamlit versions
-                try:
-                    st.image(
-                        img_bytes,
-                        caption="EVE client frame (refreshes with page auto-refresh)",
-                        use_container_width=True,
-                    )
-                except TypeError:
-                    st.image(
-                        img_bytes,
-                        caption="EVE client frame (refreshes with page auto-refresh)",
-                        use_column_width=True,
-                    )
-            except Exception as e:
-                st.warning(f"Screenshot decode failed: {e}")
-        else:
-            st.info("No screenshot yet. Expect updates every ~60s once ZombieShot is running on the host.")
+        # Screenshot is rendered above for prominent visual verification.
         
     with col_logs:
         st.subheader("Librarian Pulse & Watchdog")
@@ -1511,7 +1794,8 @@ with tab_system:
                 st.metric("DB Sync Age", f"{age:.0f}s")
                 
                 # Check for stall (Pipeline Velocity)
-                history = r.lrange("system:db_history", 0, -1)
+                # Keep this bounded; large lists can slow/hang the UI.
+                history = r.lrange("system:db_history", -10, -1)
                 
                 if len(history) >= 5:
                     # Check 5 minutes ago (index -5)
@@ -1527,7 +1811,19 @@ with tab_system:
                          st.success(f"⚡ Pipeline Velocity: ACTIVE (+{delta/5:.1f} rows/min)")
             
             with st.expander("Raw Redis Keys"):
-                st.write(r.keys("system:*"))
+                st.write(_safe_redis_keys(r, "system:*") )
+
+        st.divider()
+
+        st.subheader("Hypertable Size")
+        try:
+            sizes_df = get_hypertable_sizes_df()
+            if sizes_df.empty:
+                st.info("No hypertable size data available.")
+            else:
+                st.dataframe(sizes_df[["table", "size"]], use_container_width=True, height=180)
+        except Exception as e:
+            st.error(f"Hypertable size error: {e}")
             
     st.divider()
     st.header("Global Debug Stream")
