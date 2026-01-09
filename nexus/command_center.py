@@ -808,9 +808,22 @@ with tab_oracle:
             pass
     
     if fi_obj and isinstance(fi_obj, dict):
-        # Sort by importance decending
-        fi_sorted = sorted(fi_obj.items(), key=lambda x: x[1], reverse=True)[:10]
-        fi_df = pd.DataFrame(fi_sorted, columns=["Feature", "Importance"])
+        # Sort by importance decending (handle nested dicts from 5090)
+        def _extract_weight(val):
+            if isinstance(val, dict):
+                return float(val.get('weight', 0.0))
+            try:
+                return float(val)
+            except:
+                return 0.0
+
+        # Sort using robust key
+        fi_sorted = sorted(fi_obj.items(), key=lambda x: _extract_weight(x[1]), reverse=True)[:10]
+        
+        # Clean for chart (ensure values are floats)
+        chart_data = [(k, _extract_weight(v)) for k, v in fi_sorted]
+        
+        fi_df = pd.DataFrame(chart_data, columns=["Feature", "Importance"])
         st.bar_chart(fi_df.set_index("Feature"), color="#00ff00")
     else:
         st.info("No feature importance data available yet.")
@@ -1386,7 +1399,24 @@ with tab_performance:
                         return ""
 
                     show = resolved[["timestamp", "item_name", "reasoning", "outcome"]].head(100)
-                    st.dataframe(show.style.map(_color_outcome, subset=["outcome"]), use_container_width=True, height=260)
+                    # Polish: Formatting columns for readable reasoning
+                    st.dataframe(
+                        show.style.map(_color_outcome, subset=["outcome"]),
+                        use_container_width=True,
+                        height=260,
+                        column_config={
+                            "reasoning": st.column_config.TextColumn(
+                                "Analysis (Smith & Johnson)",
+                                help="AI Reasoning logic including Demand Shift and Volatility",
+                                width="large",
+                                max_chars=None
+                            ),
+                            "timestamp": st.column_config.DatetimeColumn(
+                                "Execute Time (UTC)",
+                                format="D MMM, HH:mm"
+                            )
+                        }
+                    )
                 except Exception as e:
                     st.error(f"Winner's Ledger error: {e}")
             else:

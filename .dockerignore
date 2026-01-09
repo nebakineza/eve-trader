@@ -4,3 +4,10 @@ __pycache__
 *.pyc
 .env
 pgdata/
+.venv*/
+node_modules/
+models/
+logs/
+*.parquet
+*.pt
+*.pth

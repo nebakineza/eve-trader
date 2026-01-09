@@ -13,8 +13,11 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Note: we keep filenames intact so specialized requirement sets (e.g. requirements.oracle.txt)
+# can safely include the base requirements.txt without self-referencing loops.
+ARG REQUIREMENTS_FILE=requirements.txt
+COPY requirements*.txt ./
+RUN pip install --no-cache-dir -r ${REQUIREMENTS_FILE}
 
 # Copy source
 COPY . .
