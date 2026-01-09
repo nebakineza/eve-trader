@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -55,6 +56,7 @@ class ShadowManager:
         confidence: float,
         warfare_isk_60m: float | None = None,
         global_market_cap_isk: float | None = None,
+        prediction_spread: float = 0.0,
     ) -> bool:
         if confidence is None or confidence < self.config.confidence_threshold:
             return False
@@ -103,6 +105,7 @@ class ShadowManager:
         try:
             reasoning = (
                 f"Smith & Johnson Demand Shift: {demand_shift:+.2%} | "
+                f"Spread: {prediction_spread:.4f} | "
                 f"Warfare Pulse: {warfare_b:.1f} B ISK | "
                 f"Predicted Return: {predicted_return:+.1%}"
             )
@@ -290,12 +293,37 @@ class ShadowManager:
                     continue
 
                 exit_price = float(exit_row[0])
-                entry = float(entry_price) if entry_price is not None else 0.0
+                
+                # Fetch reasoning to apply Jita Slippage Audit
+                # Formula: Return = (Exit - Entry) - (2 * Spread)
+                # But we apply it to the gross profit calculation logic.
+                trade_spread = 0.0
+                try:
+                    r_row = conn.execute(
+                        text("SELECT reasoning FROM shadow_trades WHERE timestamp = :ts AND type_id = :tid"),
+                        {"ts": ts, "tid": int(type_id)}
+                    ).fetchone()
+                    if r_row and r_row[0]:
+                        m = re.search(r"Spread:\s*([0-9\.]+)", str(r_row[0]))
+                        if m:
+                            trade_spread = float(m.group(1))
+                except Exception:
+                    pass
+
+                # Calculate Jita Reality Return
+                # We deduct 2 * Spread from the simplistic (Exit - Entry).
+                # Note: This is an absolute ISK deduction.
+                slippage_cost = 2.0 * trade_spread * entry # Spread is usually pct in features, so multiply by price?
+                # Check command_center.py: spread = float(item.get("spread", 0))
+                # predicted = curr * (1 + spread). So yes, spread is a percentage (e.g. 0.05 for 5%).
+                # So slippage in ISK = 2 * (spread_pct * entry).
+                slippage_isk = 2.0 * trade_spread * entry
 
                 if signal_type == "BUY":
-                    gross = exit_price - entry
+                    gross = (exit_price - entry) - slippage_isk
                     outcome = "WIN" if gross > 0 else "LOSS"
                 else:
+                    gross = (entry - exit_price) - slippage_isk
                     gross = entry - exit_price
                     outcome = "WIN" if gross > 0 else "LOSS"
 

@@ -797,7 +797,23 @@ with tab_oracle:
         st.warning(f"🚫 Last Induction Rejected: {reject_reason}")
 
     # 10D Feature Importance Audit (Top 5)
+    st.markdown("#### 🧠 The 10D 'Brain' (Feature Importance)")
     fi_obj = None
+    if r:
+        try:
+            fi_raw = r.get("oracle:feature_importance")
+            if fi_raw:
+                fi_obj = json.loads(fi_raw)
+        except Exception:
+            pass
+    
+    if fi_obj and isinstance(fi_obj, dict):
+        # Sort by importance decending
+        fi_sorted = sorted(fi_obj.items(), key=lambda x: x[1], reverse=True)[:10]
+        fi_df = pd.DataFrame(fi_sorted, columns=["Feature", "Importance"])
+        st.bar_chart(fi_df.set_index("Feature"), color="#00ff00")
+    else:
+        st.info("No feature importance data available yet.")
     if r:
         try:
             raw = r.get("oracle:feature_importance")
@@ -1695,6 +1711,22 @@ with tab_performance:
 # ========================
 with tab_system:
     st.markdown("### 🛡️ System Logs & Telemetry")
+    
+    # [Added] Stop-Loss Sensitivity Slider
+    sl_val = 1.5
+    if r:
+        try:
+           raw_sl = r.get("system:strategy:stop_loss_pct")
+           if raw_sl:
+               sl_val = float(raw_sl) * 100.0
+        except: pass
+    
+    # Slider with explicit key for state management
+    new_sl = st.slider("Stop-Loss Sensitivity (%)", 0.1, 5.0, float(sl_val), 0.1, help="Adjust global stop-loss threshold. Default 1.5%.")
+    if r and abs(new_sl - sl_val) > 1e-6:
+        r.set("system:strategy:stop_loss_pct", str(new_sl / 100.0))
+        st.toast(f"Stop-Loss Updated: {new_sl}%")
+
     col_zombie, col_logs = st.columns(2)
     
     with col_zombie:

@@ -123,7 +123,16 @@ async def main():
                     warfare_threshold = float(os.getenv("SHADOW_WARFARE_THRESHOLD_ISK", "0"))
                     war_stop_loss_pct = float(os.getenv("SHADOW_WAR_STOP_LOSS_PCT", "0.03"))
                     stop_loss_override = None
-                    if warfare_threshold > 0 and warfare_isk > warfare_threshold:
+
+                    # User Override (System Tab Slider)
+                    try:
+                       user_sl = bridge.redis_client.get("system:strategy:stop_loss_pct")
+                       if user_sl:
+                           stop_loss_override = float(user_sl)
+                    except Exception:
+                       pass
+
+                    if stop_loss_override is None and warfare_threshold > 0 and warfare_isk > warfare_threshold:
                         stop_loss_override = war_stop_loss_pct
                         logger.warning(
                             "Traffic Guardrail ACTIVE: warfare_isk=%.2f > threshold=%.2f -> stop_loss=%.3f",
@@ -234,6 +243,8 @@ async def main():
                                 features.setdefault('best_ask', best_ask)
                                 features.setdefault('price', market_price)
                                 features.setdefault('imbalance', (buy_vol + 1.0) / (sell_vol + 1.0))
+                                spread_est = (best_ask - best_bid) / best_ask if best_ask > 0 else 0.0
+                                features.setdefault('spread', spread_est)
                     except Exception as e:
                         logger.warning(f"Order-book fallback failed for {type_id}: {e}")
 
@@ -315,6 +326,7 @@ async def main():
                             predicted_price=float(predicted_price) if predicted_price is not None else None,
                             current_price=float(current_price) if current_price is not None else None,
                             confidence=float(confidence) if confidence is not None else 0.0,
+                            prediction_spread=float(features.get('spread', 0.0))
                             warfare_isk_60m=warfare_isk,
                             global_market_cap_isk=global_cap_isk,
                         )
