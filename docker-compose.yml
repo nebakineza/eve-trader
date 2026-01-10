@@ -147,11 +147,11 @@ services:
       - cache
       - db
     devices:
-      - /dev/ttyACM0:/dev/ttyACM0
+      - /dev/serial/by-id/usb-Arduino_LLC_USB_IO_Board_HIDFG-if00:/dev/arduino
     environment:
       - REDIS_URL=redis://cache:6379/0
       - DATABASE_URL=postgresql://eve_user:eve_pass@eve-trader-db:5432/eve_market_data
-      - ARDUINO_PORT=/dev/ttyACM0
+      - ARDUINO_PORT=/dev/arduino
       - ARDUINO_BAUD=9600
       - ARDUINO_DRY_RUN=0
       - RETRY_SECONDS=5

@@ -1,0 +1,8 @@
+# Production host venv entrypoint (single repo-wide .venv)
+#
+# Keep this venv compatible with the pinned core deps in requirements.txt.
+# OpenCV 4.12+ requires numpy>=2, which conflicts with our pinned numpy==1.26.2,
+# so we pin OpenCV to the last numpy<2 compatible series.
+
+-r requirements.txt
+opencv-python-headless==4.11.0.86

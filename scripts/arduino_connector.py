@@ -102,6 +102,32 @@ class ArduinoBridge:
         logger.error(f"Handshake failed: expected PONG, got {line!r}")
         return False
 
+    def query_caps(self, timeout_s: float = 1.5) -> set[str]:
+        """Query firmware capabilities via CAPS.
+
+        Expected response: "CAPS:..." (comma-separated tokens).
+        Returns an empty set if unavailable.
+        """
+        if not self.is_active():
+            return set()
+        try:
+            try:
+                self.connection.reset_input_buffer()
+            except Exception:
+                pass
+            if not self.send_command("CAPS"):
+                return set()
+            line = self.read_line(timeout_s=timeout_s)
+            if not line:
+                return set()
+            s = str(line).strip()
+            if not s.startswith("CAPS:"):
+                return set()
+            tokens = [t.strip() for t in s[len("CAPS:") :].split(",") if t.strip()]
+            return set(tokens)
+        except Exception:
+            return set()
+
     def is_active(self):
         return self.connection is not None and self.connection.is_open
 

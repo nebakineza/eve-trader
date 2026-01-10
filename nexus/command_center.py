@@ -190,6 +190,153 @@ def get_shadow_trade_outcomes_df(limit: int = 100, horizon_minutes: int = 60, fe
         )
 
 
+def _server_today_utc_window() -> tuple[datetime, datetime]:
+    now_local = datetime.now().astimezone()
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+@st.cache_data(ttl=60)
+def get_shadow_trade_outcomes_window_df(
+    *,
+    start_utc: datetime,
+    end_utc: datetime,
+    limit: int = 5000,
+    horizon_minutes: int = 60,
+) -> pd.DataFrame:
+    if not db_engine:
+        return pd.DataFrame()
+
+    # Ensure schema exists before selecting optional columns.
+    try:
+        ddl_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "storage", "shadow_ledger.sql")
+        with open(ddl_path, "r", encoding="utf-8") as f:
+            ddl = f.read()
+        with db_engine.begin() as conn:
+            for stmt in ddl.split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    conn.execute(text(stmt))
+    except Exception:
+        pass
+
+    with db_engine.connect() as conn:
+        return pd.read_sql(
+            text(
+                """
+                SELECT
+                    t.type_id,
+                    t.signal_type,
+                    t.actual_price_at_time AS entry_price,
+                    mh.close AS exit_price,
+                    t.reasoning,
+                    t.virtual_outcome,
+                    t.timestamp
+                FROM shadow_trades t
+                LEFT JOIN LATERAL (
+                    SELECT close
+                    FROM market_history
+                    WHERE type_id = t.type_id
+                      AND timestamp >= t.timestamp + (:horizon || ' minutes')::interval
+                    ORDER BY timestamp ASC
+                    LIMIT 1
+                ) mh ON TRUE
+                WHERE t.timestamp >= :start_ts
+                  AND t.timestamp < :end_ts
+                ORDER BY t.timestamp DESC
+                LIMIT :limit
+                """
+            ),
+            conn,
+            params={
+                "limit": int(limit),
+                "horizon": int(horizon_minutes),
+                "start_ts": start_utc,
+                "end_ts": end_utc,
+            },
+        )
+
+
+@st.cache_data(ttl=60)
+def get_shadow_trade_completed_df(*, limit: int = 200, horizon_minutes: int = 60) -> pd.DataFrame:
+    if not db_engine:
+        return pd.DataFrame()
+
+    with db_engine.connect() as conn:
+        return pd.read_sql(
+            text(
+                """
+                SELECT
+                    t.type_id,
+                    t.signal_type,
+                    t.actual_price_at_time AS entry_price,
+                    mh.close AS exit_price,
+                    t.reasoning,
+                    t.virtual_outcome,
+                    t.timestamp
+                FROM shadow_trades t
+                LEFT JOIN LATERAL (
+                    SELECT close
+                    FROM market_history
+                    WHERE type_id = t.type_id
+                      AND timestamp >= t.timestamp + (:horizon || ' minutes')::interval
+                    ORDER BY timestamp ASC
+                    LIMIT 1
+                ) mh ON TRUE
+                WHERE t.timestamp <= NOW() - (:horizon || ' minutes')::interval
+                  AND mh.close IS NOT NULL
+                ORDER BY t.timestamp DESC
+                LIMIT :limit
+                """
+            ),
+            conn,
+            params={"limit": int(limit), "horizon": int(horizon_minutes)},
+        )
+
+
+@st.cache_data(ttl=60)
+def get_shadow_trade_completed_by_side_df(*, side: str, limit: int = 200, horizon_minutes: int = 60) -> pd.DataFrame:
+    if not db_engine:
+        return pd.DataFrame()
+
+    side_u = str(side or "").strip().upper()
+    if side_u not in {"BUY", "SELL"}:
+        return pd.DataFrame()
+
+    with db_engine.connect() as conn:
+        return pd.read_sql(
+            text(
+                """
+                SELECT
+                    t.type_id,
+                    t.signal_type,
+                    t.actual_price_at_time AS entry_price,
+                    mh.close AS exit_price,
+                    t.reasoning,
+                    t.virtual_outcome,
+                    t.timestamp
+                FROM shadow_trades t
+                LEFT JOIN LATERAL (
+                    SELECT close
+                    FROM market_history
+                    WHERE type_id = t.type_id
+                      AND timestamp >= t.timestamp + (:horizon || ' minutes')::interval
+                    ORDER BY timestamp ASC
+                    LIMIT 1
+                ) mh ON TRUE
+                WHERE t.signal_type = :side
+                  AND t.timestamp <= NOW() - (:horizon || ' minutes')::interval
+                  AND mh.close IS NOT NULL
+                ORDER BY t.timestamp DESC
+                LIMIT :limit
+                """
+            ),
+            conn,
+            params={"limit": int(limit), "horizon": int(horizon_minutes), "side": side_u},
+        )
+
+
 @st.cache_data(ttl=300)
 def get_item_roi_df(limit: int = 5, horizon_minutes: int = 60, fee_rate: float = 0.025) -> pd.DataFrame:
     if not db_engine:
@@ -351,6 +498,17 @@ def _read_macro_history(*, redis_client, key: str, max_points: int) -> pd.Series
 @st.cache_resource
 def get_redis_client():
     return redis.Redis(host=os.getenv('REDIS_HOST', 'cache'), port=6379, db=0, decode_responses=True)
+
+
+def _norm_redis_text(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            return v.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+    return str(v)
 
 try:
     r = get_redis_client()
@@ -1490,11 +1648,17 @@ with tab_performance:
     # Trade Performance Table (color-coded)
     if db_engine:
         try:
-            perf_df = get_shadow_trade_outcomes_df(limit=100, horizon_minutes=60, fee_rate=0.025)
+            start_utc, end_utc = _server_today_utc_window()
+            today_df = get_shadow_trade_outcomes_window_df(
+                start_utc=start_utc,
+                end_utc=end_utc,
+                limit=int(os.getenv("TODAY_WINNERS_MAX_ROWS", "5000")),
+                horizon_minutes=int(os.getenv("SHADOW_TRADE_HORIZON_MINUTES", "60")),
+            )
 
-            if not perf_df.empty:
+            if not today_df.empty:
                 # Compute realized profit + status for coloring.
-                dfp = perf_df.copy()
+                dfp = today_df.copy()
                 dfp["entry_price"] = pd.to_numeric(dfp.get("entry_price"), errors="coerce")
                 dfp["exit_price"] = pd.to_numeric(dfp.get("exit_price"), errors="coerce")
 
@@ -1525,139 +1689,128 @@ with tab_performance:
                     return "background-color: #28a745; color: white" if float(v) > 0 else "background-color: #dc3545; color: white"
 
 
-                st.subheader("Recent Trade Performance (Biggest Wins)")
-                
-                # Sort by profit_net DESC to show biggest winners first
-                dfp = dfp.sort_values(by="profit_net", ascending=False)
-                
-                show_cols = [c for c in ["timestamp", "type_id", "signal_type", "entry_price", "exit_price", "profit_net", "status"] if c in dfp.columns]
-                styled = dfp[show_cols].style.applymap(_color_profit, subset=["profit_net"])
-                st.dataframe(styled, use_container_width=True, height=300)
+                st.subheader("Top Winners (Today)")
 
-                # Winner's Ledger: per-trade reasoning + outcome color.
-                st.subheader("Market Maker Ledger") # Renamed from Trading Ledger
+                completed_mask = ~dfp["profit_net"].isna()
+                winners_today = dfp[completed_mask & (dfp["profit_net"] > 0)].copy()
+
+                if winners_today.empty:
+                    st.info("No winning completed trades today yet.")
+                else:
+                    winners_today = winners_today.sort_values(by="profit_net", ascending=False)
+                    winners_today = winners_today.head(int(os.getenv("TODAY_WINNERS_TOP_N", "50")))
+                    winners_today["status"] = "WIN"
+                    show_cols = [
+                        c
+                        for c in [
+                            "timestamp",
+                            "type_id",
+                            "signal_type",
+                            "entry_price",
+                            "exit_price",
+                            "profit_net",
+                            "status",
+                        ]
+                        if c in winners_today.columns
+                    ]
+                    styled = winners_today[show_cols].style.map(_color_profit, subset=["profit_net"])
+                    st.dataframe(styled, use_container_width=True, height=300)
+
+                # Market Maker Ledger: show most recent COMPLETED BUY and SELL orders.
+                st.subheader("Market Maker Ledger")
                 try:
-                    # Resolve item names
-                    type_ids = [int(x) for x in dfp["type_id"].dropna().astype(int).tolist()]
-                    type_names = resolve_type_names(type_ids)
-                    ledger = dfp.copy()
-                    ledger["item_name"] = ledger["type_id"].apply(lambda x: type_names.get(str(int(x)), f"Type {int(x)}") if pd.notna(x) else "Unknown")
-                    
-                    # Columns aligned with EVE Wallet
-                    ledger_cols = ["timestamp", "item_name", "entry_price", "exit_price", "profit_net", "reasoning"]
-                    
-                    # Create Tabs
-                    tab_wins, tab_loss = st.tabs(["🏆 Winners", "📉 Losers"])
-                    
-                    with tab_wins:
-                         wins_df = ledger[ledger['profit_net'] > 0]
-                         if not wins_df.empty:
-                             st.dataframe(wins_df[ledger_cols].style.format({"profit_net": "{:,.2f}"}), use_container_width=True)
-                         else:
-                             st.info("No wins yet.")
+                    horizon_m = int(os.getenv("SHADOW_TRADE_HORIZON_MINUTES", "60"))
+                    max_rows = int(os.getenv("LEDGER_RECENT_COMPLETED_ROWS", "50"))
+                    fetch_n = max(200, int(os.getenv("LEDGER_SIDE_FETCH_ROWS", str(max_rows * 10))))
 
-                    with tab_loss:
-                         loss_df = ledger[ledger['profit_net'] <= 0]
-                         if not loss_df.empty:
-                             st.dataframe(loss_df[ledger_cols].style.format({"profit_net": "{:,.2f}"}), use_container_width=True)
-                         else:
-                             st.success("No losses recorded.")
-                             
+                    buy_ledger = get_shadow_trade_completed_by_side_df(
+                        side="BUY",
+                        limit=fetch_n,
+                        horizon_minutes=horizon_m,
+                    ).copy()
+                    sell_ledger = get_shadow_trade_completed_by_side_df(
+                        side="SELL",
+                        limit=fetch_n,
+                        horizon_minutes=horizon_m,
+                    ).copy()
+
+                    ledger_combined = pd.concat([buy_ledger, sell_ledger], ignore_index=True)
+                    ledger_combined["entry_price"] = pd.to_numeric(ledger_combined.get("entry_price"), errors="coerce")
+                    ledger_combined["exit_price"] = pd.to_numeric(ledger_combined.get("exit_price"), errors="coerce")
+                    ledger_combined["profit_net"] = ledger_combined.apply(_profit_net, axis=1)
+                    ledger_combined["status"] = ledger_combined["profit_net"].apply(
+                        lambda v: "PENDING" if pd.isna(v) else ("WIN" if float(v) > 0 else "LOSS")
+                    )
+
+                    # Resolve item names (bounded to what's displayed).
+                    type_ids = [int(x) for x in ledger_combined["type_id"].dropna().astype(int).unique().tolist()]
+                    type_names = resolve_type_names(type_ids)
+                    ledger_combined["item_name"] = ledger_combined["type_id"].apply(
+                        lambda x: type_names.get(str(int(x)), f"Type {int(x)}") if pd.notna(x) else "Unknown"
+                    )
+
+                    def _add_item_name(df: pd.DataFrame) -> pd.DataFrame:
+                        if df is None or df.empty or "type_id" not in df.columns:
+                            return df
+                        out = df.copy()
+                        out["item_name"] = out["type_id"].apply(
+                            lambda x: type_names.get(str(int(x)), f"Type {int(x)}") if pd.notna(x) else "Unknown"
+                        )
+                        return out
+
+                    ledger_cols = [
+                        "timestamp",
+                        "item_name",
+                        "entry_price",
+                        "exit_price",
+                        "profit_net",
+                        "status",
+                        "reasoning",
+                    ]
+
+                    tab_buy, tab_sell = st.tabs(["BUY ORDERS", "SELL ORDERS"])
+                    with tab_buy:
+                        buy_df = _add_item_name(buy_ledger)
+                        buy_df["entry_price"] = pd.to_numeric(buy_df.get("entry_price"), errors="coerce")
+                        buy_df["exit_price"] = pd.to_numeric(buy_df.get("exit_price"), errors="coerce")
+                        buy_df["profit_net"] = buy_df.apply(_profit_net, axis=1)
+                        buy_df["status"] = buy_df["profit_net"].apply(
+                            lambda v: "PENDING" if pd.isna(v) else ("WIN" if float(v) > 0 else "LOSS")
+                        )
+                        buy_df = buy_df.sort_values(by="timestamp", ascending=False).head(max_rows)
+                        if buy_df.empty:
+                            st.info("No completed BUY orders yet.")
+                        else:
+                            buy_cols = [c for c in ledger_cols if c in buy_df.columns]
+                            st.dataframe(
+                                buy_df[buy_cols].style.format({"profit_net": "{:,.2f}"}),
+                                use_container_width=True,
+                            )
+
+                    with tab_sell:
+                        sell_df = _add_item_name(sell_ledger)
+                        sell_df["entry_price"] = pd.to_numeric(sell_df.get("entry_price"), errors="coerce")
+                        sell_df["exit_price"] = pd.to_numeric(sell_df.get("exit_price"), errors="coerce")
+                        sell_df["profit_net"] = sell_df.apply(_profit_net, axis=1)
+                        sell_df["status"] = sell_df["profit_net"].apply(
+                            lambda v: "PENDING" if pd.isna(v) else ("WIN" if float(v) > 0 else "LOSS")
+                        )
+                        sell_df = sell_df.sort_values(by="timestamp", ascending=False).head(max_rows)
+                        if sell_df.empty:
+                            st.info("No completed SELL orders yet.")
+                        else:
+                            sell_cols = [c for c in ledger_cols if c in sell_df.columns]
+                            st.dataframe(
+                                sell_df[sell_cols].style.format({"profit_net": "{:,.2f}"}),
+                                use_container_width=True,
+                            )
+
                 except Exception as e:
                     st.error(f"Ledger error: {e}")
-                    
-                    # Filter for Winners/Losers Tabs
-                    tab_w, tab_l = st.tabs(["🏆 Winners", "📉 Losers"])
-                    
-                    # Define color helper for Status column
-                    def _color_outcome(val):
-                        if str(val) == "WIN": return "background-color: #28a745; color: white"
-                        if str(val) == "LOSS": return "background-color: #dc3545; color: white"
-                        return ""
-                    
-                    # Calculate Profit Net helper
-                    def _calc_profit(df):
-                        if df.empty: return df
-                        df["entry_price"] = pd.to_numeric(df.get("entry_price"), errors="coerce")
-                        df["exit_price"] = pd.to_numeric(df.get("exit_price"), errors="coerce")
-                        def _pn(row):
-                            ep = row.get("entry_price")
-                            xp = row.get("exit_price")
-                            if ep is None or xp is None or pd.isna(ep) or pd.isna(xp) or float(ep) <= 0:
-                                return np.nan
-                            if str(row.get("signal_type", "")).upper() == "BUY":
-                                gross = float(xp) - float(ep)
-                            else:
-                                gross = float(ep) - float(xp)
-                            return gross * (1.0 - 0.025)
-                        df["profit_net"] = df.apply(_pn, axis=1)
-                        return df
-
-                    with tab_w:
-                         # Fetch known WINs directly from DB
-                         winners_raw = get_resolved_trades_df("WIN", limit=50)
-                         winners = _calc_profit(winners_raw)
-                         
-                         if not winners.empty:
-                             # Re-sort by calculated profit just in case
-                             winners = winners.sort_values("profit_net", ascending=False)
-                             
-                             # Name resolution
-                             if "type_id" in winners.columns:
-                                w_ids = [int(x) for x in winners["type_id"].dropna().unique().tolist()]
-                                w_names = resolve_type_names(w_ids)
-                                winners["item_name"] = winners["type_id"].apply(lambda x: w_names.get(str(int(x)), f"Type {int(x)}"))
-                             
-                             show_w = winners.rename(columns=ledger_cols)
-                             # safe select
-                             show_cols = [c for c in ledger_cols.values() if c in show_w.columns]
-                             
-                             st.dataframe(
-                                show_w[show_cols].style.map(_color_outcome, subset=["Status"]),
-                                use_container_width=True,
-                                height=400,
-                                column_config={
-                                    "Strategy Logic": st.column_config.TextColumn(width="medium"),
-                                    "Timestamp": st.column_config.DatetimeColumn(format="D MMM HH:mm"),
-                                    "Net ISK": st.column_config.NumberColumn(format="%.2f ISK"),
-                                    "Price (Entry)": st.column_config.NumberColumn(format="%.2f ISK")
-                                }
-                             )
-                         else:
-                             st.info("No realized wins found in history.")
-
-                    with tab_l:
-                         losers_raw = get_resolved_trades_df("LOSS", limit=50)
-                         losers = _calc_profit(losers_raw)
-                         
-                         if not losers.empty:
-                             losers = losers.sort_values("profit_net", ascending=True)
-
-                             if "type_id" in losers.columns:
-                                l_ids = [int(x) for x in losers["type_id"].dropna().unique().tolist()]
-                                l_names = resolve_type_names(l_ids)
-                                losers["item_name"] = losers["type_id"].apply(lambda x: l_names.get(str(int(x)), f"Type {int(x)}"))
-                             
-                             show_l = losers.rename(columns=ledger_cols)
-                             show_cols = [c for c in ledger_cols.values() if c in show_l.columns]
-                             
-                             st.dataframe(
-                                show_l[show_cols].style.map(_color_outcome, subset=["Status"]),
-                                use_container_width=True,
-                                height=400,
-                                column_config={
-                                    "Strategy Logic": st.column_config.TextColumn(width="medium"),
-                                    "Timestamp": st.column_config.DatetimeColumn(format="D MMM HH:mm"),
-                                    "Net ISK": st.column_config.NumberColumn(format="%.2f ISK"),
-                                    "Price (Entry)": st.column_config.NumberColumn(format="%.2f ISK")
-                                }
-                             )
-                         else:
-                             st.success("No realized losses found in history.")
                 except Exception as e:
                     st.error(f"Ledger error: {e}")
             else:
-                st.info("No shadow trades recorded yet.")
+                st.info("No shadow trades recorded today yet.")
         except Exception as e:
             st.error(f"Trade performance table error: {e}")
 
@@ -2078,6 +2231,49 @@ with tab_system:
         st.markdown("**Visual Verification (Live Frame):**")
         st.caption("To engage the physical execution layer, ensure HARDWARE_LOCK is OFF (UNLOCKED/armed).")
 
+        visual_status_raw = None
+        visual_stream_raw = None
+        if r:
+            try:
+                visual_status_raw = r.get("system:visual:status")
+                visual_stream_raw = r.get("system:visual:stream")
+            except Exception:
+                visual_status_raw = None
+                visual_stream_raw = None
+
+        visual_status_str = _norm_redis_text(visual_status_raw).strip().upper()
+
+        # If the status key is missing, default to a safe, explicit state.
+        # This avoids confusing 'UNKNOWN' while keeping the safety gate strict
+        # (only VERIFIED enables hardware actions).
+        visual_stream_str = _norm_redis_text(visual_stream_raw).strip().upper()
+
+        if not visual_status_str:
+            if visual_stream_str == "STREAM_OFFLINE":
+                visual_status_str = "OFFLINE"
+            else:
+                visual_status_str = "UNVERIFIED"
+
+        visual_verified = visual_status_str == "VERIFIED"
+        st.caption(f"Visual status: {visual_status_str}")
+
+        c_btn1, c_btn2 = st.columns([1, 3])
+        with c_btn1:
+            enter_disabled = bool(hardware_lock_state) or (not visual_verified)
+            if st.button("Enter Hangar", disabled=enter_disabled):
+                if not visual_verified:
+                    st.warning("Visual status is not VERIFIED; Arduino bridge will discard this request.")
+                elif r:
+                    try:
+                        r.set("system:hardware:enter_hangar", str(int(time.time())))
+                        st.success("Enter Hangar queued (hardware-only).")
+                    except Exception as e:
+                        st.error(f"Failed to queue Enter Hangar: {e}")
+                else:
+                    st.error("Redis unavailable")
+        with c_btn2:
+            st.caption("Sends a hardware-only ENTER sequence (requires system:visual:status=VERIFIED).")
+
         refresh_seconds = int(os.getenv("ZOMBIE_SHOT_VIEW_REFRESH_SECONDS", "5"))
         fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
 
@@ -2085,10 +2281,16 @@ with tab_system:
             if r:
                 try:
                     shot_b64 = r.get("system:zombie:screenshot")
+                    visual_status = r.get("system:visual:status")
+                    visual_stream = r.get("system:visual:stream")
                 except Exception:
                     shot_b64 = None
+                    visual_status = None
+                    visual_stream = None
             else:
                 shot_b64 = None
+                visual_status = None
+                visual_stream = None
 
             if not shot_b64:
                 st.info(
@@ -2106,6 +2308,11 @@ with tab_system:
                     st.image(media_bytes, caption=caption, use_container_width=True)
                 except TypeError:
                     st.image(media_bytes, caption=caption, use_column_width=True)
+
+                vs = _norm_redis_text(visual_status).strip().upper()
+                vstream = _norm_redis_text(visual_stream).strip().upper()
+                if is_gif and (vs == "OFFLINE" or vstream == "STREAM_OFFLINE"):
+                    st.caption("Visual stream is OFFLINE — showing last known good clip.")
             except Exception as e:
                 st.warning(f"Capture decode failed: {e}")
 

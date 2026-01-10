@@ -1,0 +1,6 @@
+# Backward-compatible alias.
+#
+# Use requirements.venv.prod.txt as the single source of truth for the production
+# host venv (repo-wide .venv).
+
+-r requirements.venv.prod.txt

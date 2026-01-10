@@ -253,11 +253,22 @@ ZOMBIE_EULA_REDIS_KEY="${ZOMBIE_EULA_REDIS_KEY:-system:zombie:eula_accept}"
 if [ "${ZOMBIE_DISABLE_LAUNCHER_CONTROL:-0}" = "1" ]; then
     echo "[ok] launcher_control disabled (ZOMBIE_DISABLE_LAUNCHER_CONTROL=1)."
 elif [ -f "$LAUNCHER_CONTROL_SCRIPT" ] && [ "$EVE_TARGET_EXE" != "$EVE_EXE" ]; then
+    # Prefer the repo-wide venv, but fall back to the legacy per-script venv, then system python.
+    LAUNCHER_CONTROL_PYTHON_DEFAULT="$REPO_ROOT/.venv/bin/python"
+    LAUNCHER_CONTROL_PYTHON_LEGACY="$REPO_ROOT/.venv_launcher_control/bin/python"
+    if [ -x "$LAUNCHER_CONTROL_PYTHON_DEFAULT" ]; then
+        LAUNCHER_CONTROL_PYTHON="$LAUNCHER_CONTROL_PYTHON_DEFAULT"
+    elif [ -x "$LAUNCHER_CONTROL_PYTHON_LEGACY" ]; then
+        LAUNCHER_CONTROL_PYTHON="$LAUNCHER_CONTROL_PYTHON_LEGACY"
+    else
+        LAUNCHER_CONTROL_PYTHON="python3"
+    fi
+
     if [ -f /tmp/launcher_control.pid ] && ps -p "$(cat /tmp/launcher_control.pid 2>/dev/null)" >/dev/null 2>&1; then
         echo "[ok] launcher_control already running (pid=$(cat /tmp/launcher_control.pid))"
     else
         echo "[*] Starting launcher_control loop (poll=${ZOMBIE_LAUNCHER_POLL_SECONDS}s)..."
-        nohup python3 "$LAUNCHER_CONTROL_SCRIPT" \
+        nohup "$LAUNCHER_CONTROL_PYTHON" "$LAUNCHER_CONTROL_SCRIPT" \
             --loop \
             --interval-seconds "$ZOMBIE_LAUNCHER_POLL_SECONDS" \
             --launcher-window-pattern "$ZOMBIE_LAUNCHER_WINDOW_PATTERN" \

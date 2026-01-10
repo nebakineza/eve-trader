@@ -23,6 +23,24 @@ def _redis_client() -> redis.Redis:
     return r
 
 
+def _bridge_supports_mouse(bridge) -> bool:
+    """Best-effort capability detection.
+
+    Old firmware may respond to PING but not CAPS; in that case we conservatively
+    treat mouse as unsupported to avoid silently 'succeeding' without real clicks.
+    """
+    try:
+        if not getattr(bridge, "is_active", lambda: False)():
+            return False
+        query_caps = getattr(bridge, "query_caps", None)
+        if query_caps is None:
+            return False
+        caps = set(query_caps() or set())
+        return ("MOUSE" in caps) or ("MOVCLK_V1" in caps)
+    except Exception:
+        return False
+
+
 def _set_status(r: redis.Redis, status: str, detail: str | None = None) -> None:
     # Dashboard reads zombie:hid_status (GREEN => online).
     r.set("zombie:hid_status", status)
@@ -116,6 +134,42 @@ def _consume_handshake_request(r: redis.Redis) -> None:
     # One-shot semantics: delete first so we never double-fire.
     try:
         r.delete("system:hardware:handshake")
+    except Exception:
+        pass
+
+
+def _enter_hangar_requested(r: redis.Redis) -> bool:
+    try:
+        v = r.get("system:hardware:enter_hangar")
+        if v is None:
+            return False
+        s = str(v).strip().lower()
+        return s in {"1", "true", "yes", "go", "now"} or s != ""
+    except Exception:
+        return False
+
+
+def _consume_enter_hangar_request(r: redis.Redis) -> None:
+    try:
+        r.delete("system:hardware:enter_hangar")
+    except Exception:
+        pass
+
+
+def _hardware_click_requested(r: redis.Redis) -> str | None:
+    try:
+        v = r.get("system:hardware:click")
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+    except Exception:
+        return None
+
+
+def _consume_hardware_click_request(r: redis.Redis) -> None:
+    try:
+        r.delete("system:hardware:click")
     except Exception:
         pass
 
@@ -278,20 +332,13 @@ def main() -> int:
 
     while True:
         try:
+            mouse_supported = True if dry_run else False
+
             # (Re)connect to Arduino if needed
             if not dry_run and (bridge is None or not bridge.is_active()):
-                bridge = ArduinoBridge(baud_rate=baud_rate)
-                # If user specified a fixed port, prefer it.
-                if serial_port:
-                    try:
-                        import serial
-
-                        bridge.port = serial_port
-                        bridge.connection = serial.Serial(serial_port, baud_rate, timeout=1)
-                        time.sleep(2)
-                    except Exception as e:
-                        bridge.connection = None
-                        logger.error(f"Failed to open {serial_port}: {e}")
+                # If user specified a fixed port (e.g., /dev/serial/by-id/...), use it directly.
+                # This avoids a misleading "No Arduino detected" warning during the initial scan.
+                bridge = ArduinoBridge(baud_rate=baud_rate, port=serial_port or None)
 
             # In dry-run, force an always-active bridge and do not publish SERIAL mode.
             if dry_run:
@@ -322,6 +369,9 @@ def main() -> int:
                         return 1
                     time.sleep(retry_seconds)
                     continue
+
+            if not dry_run:
+                mouse_supported = _bridge_supports_mouse(bridge)
 
             # EULA Handshake (hardware macro): END -> wait -> RETURN/ENTER
             # Safety: never allow a queued handshake to execute later after an unlock.
@@ -374,6 +424,145 @@ def main() -> int:
                 except Exception:
                     pass
                 # After handshake, wait one poll interval to avoid accidental rapid repeats.
+                if once:
+                    return 0 if (ok1 and ok2) else 1
+                time.sleep(poll_seconds)
+                continue
+
+            # Enter Hangar (manual one-shot): usually mapped to ENTER on Character Select / confirmation.
+            if r and _enter_hangar_requested(r):
+                if not _is_visual_verified(r):
+                    _consume_enter_hangar_request(r)
+                    logger.warning("🚪 Enter Hangar requested but system:visual:status != VERIFIED; discarding request.")
+                    if once:
+                        return 0
+                    time.sleep(poll_seconds)
+                    continue
+
+                if _is_hardware_locked(r):
+                    _consume_enter_hangar_request(r)
+                    logger.warning("🚪 Enter Hangar requested but HARDWARE_LOCK is enabled; discarding request.")
+                    if once:
+                        return 0
+                    time.sleep(poll_seconds)
+                    continue
+
+                _consume_enter_hangar_request(r)
+                cmds = [c.strip() for c in os.getenv("ENTER_HANGAR_COMMANDS", "ENTER,ENTER").split(",") if c.strip()]
+                delay_ms = int(os.getenv("ENTER_HANGAR_DELAY_MS", "800"))
+                logger.info("🚪 Enter Hangar requested: sending %s (delay=%dms)", cmds, delay_ms)
+                ok_all = True
+                for idx, cmd in enumerate(cmds):
+                    ok_all = bool(bridge.send_command(cmd)) and ok_all
+                    if idx < len(cmds) - 1:
+                        time.sleep(max(0.0, float(delay_ms) / 1000.0))
+                try:
+                    r.lpush(
+                        "arduino:command_log",
+                        json.dumps(
+                            {
+                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "command": "ENTER_HANGAR",
+                                "sequence": cmds,
+                                "delay_ms": int(delay_ms),
+                                "ok": bool(ok_all),
+                            }
+                        ),
+                    )
+                    r.ltrim("arduino:command_log", 0, 499)
+                except Exception:
+                    pass
+
+                if once:
+                    return 0 if ok_all else 1
+                time.sleep(poll_seconds)
+                continue
+
+            # Generic one-shot hardware click (x,y). Intended for launcher_control Play Now.
+            if r:
+                click_val = _hardware_click_requested(r)
+            else:
+                click_val = None
+
+            if r and click_val:
+                if not mouse_supported:
+                    _consume_hardware_click_request(r)
+                    logger.warning(
+                        "🖱️ Click requested but Arduino firmware lacks mouse support (no CAPS:MOUSE/MOVCLK_V1); discarding."
+                    )
+                    try:
+                        r.lpush(
+                            "arduino:command_log",
+                            json.dumps(
+                                {
+                                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                                    "command": "CLICK",
+                                    "x": None,
+                                    "y": None,
+                                    "sequence": [],
+                                    "ok": False,
+                                    "reason": "FIRMWARE_NO_MOUSE",
+                                }
+                            ),
+                        )
+                        r.ltrim("arduino:command_log", 0, 499)
+                    except Exception:
+                        pass
+                    if once:
+                        return 0
+                    time.sleep(poll_seconds)
+                    continue
+
+                if not _is_visual_verified(r):
+                    _consume_hardware_click_request(r)
+                    logger.warning("🖱️ Click requested but system:visual:status != VERIFIED; discarding request.")
+                    if once:
+                        return 0
+                    time.sleep(poll_seconds)
+                    continue
+
+                if _is_hardware_locked(r):
+                    _consume_hardware_click_request(r)
+                    logger.warning("🖱️ Click requested but HARDWARE_LOCK is enabled; discarding request.")
+                    if once:
+                        return 0
+                    time.sleep(poll_seconds)
+                    continue
+
+                _consume_hardware_click_request(r)
+                try:
+                    xs, ys = click_val.split(",", 1)
+                    x = int(xs.strip())
+                    y = int(ys.strip())
+                except Exception:
+                    logger.warning("🖱️ Click request malformed (%r); discarding.", click_val)
+                    if once:
+                        return 0
+                    time.sleep(poll_seconds)
+                    continue
+
+                logger.info("🖱️ Click requested: MOV:%d,%d then CLK", x, y)
+                ok1 = bridge.send_command(f"MOV:{x},{y}")
+                time.sleep(0.1)
+                ok2 = bridge.send_command("CLK")
+                try:
+                    r.lpush(
+                        "arduino:command_log",
+                        json.dumps(
+                            {
+                                "timestamp": datetime.utcnow().isoformat() + "Z",
+                                "command": "CLICK",
+                                "x": x,
+                                "y": y,
+                                "sequence": [f"MOV:{x},{y}", "CLK"],
+                                "ok": bool(ok1 and ok2),
+                            }
+                        ),
+                    )
+                    r.ltrim("arduino:command_log", 0, 499)
+                except Exception:
+                    pass
+
                 if once:
                     return 0 if (ok1 and ok2) else 1
                 time.sleep(poll_seconds)

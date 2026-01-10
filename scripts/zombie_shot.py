@@ -23,6 +23,7 @@ VISUAL_STREAM_KEY = os.getenv("VISUAL_STREAM_KEY", "system:visual:stream")
 VISUAL_STREAM_OK = os.getenv("VISUAL_STREAM_OK", "STREAM_OK")
 VISUAL_STREAM_OFFLINE = os.getenv("VISUAL_STREAM_OFFLINE", "STREAM_OFFLINE")
 VISUAL_STATUS_DEFAULT = os.getenv("VISUAL_STATUS_DEFAULT", "UNVERIFIED")
+VISUAL_STATUS_LIVE = os.getenv("VISUAL_STATUS_LIVE", "VERIFIED")
 VISUAL_STATUS_OFFLINE = os.getenv("VISUAL_STATUS_OFFLINE", "OFFLINE")
 
 
@@ -79,6 +80,16 @@ def _read_line(sock: socket.socket) -> bytes:
             return bytes(data)
 
 
+def _read_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Redis connection closed")
+        buf += chunk
+    return bytes(buf)
+
+
 def _send_resp_array(sock: socket.socket, parts: list[bytes]) -> None:
     out = bytearray()
     out += f"*{len(parts)}\r\n".encode("ascii")
@@ -102,6 +113,41 @@ def redis_set(redis_url: str, key: str, value: bytes) -> None:
         resp = _read_line(sock)
         if not resp.startswith(b"+"):
             raise RuntimeError(f"Redis SET failed: {resp!r}")
+
+
+def redis_get(redis_url: str, key: str) -> bytes | None:
+    target = _parse_redis_url(redis_url)
+    with socket.create_connection((target.host, target.port), timeout=5) as sock:
+        if target.db:
+            _send_resp_array(sock, [b"SELECT", str(target.db).encode("ascii")])
+            resp = _read_line(sock)
+            if not resp.startswith(b"+"):
+                raise RuntimeError(f"Redis SELECT failed: {resp!r}")
+
+        _send_resp_array(sock, [b"GET", key.encode("utf-8")])
+        prefix = _read_exact(sock, 1)
+        if prefix == b"$":
+            # Bulk string: length line already started; read the rest of the line and then the body.
+            rest = _read_line(sock)
+            header = prefix + rest
+            length = int(header[1:-2])
+            if length == -1:
+                return None
+            data = _read_exact(sock, length)
+            crlf = _read_exact(sock, 2)
+            if crlf != b"\r\n":
+                raise RuntimeError("Invalid bulk string terminator")
+            return data
+        if prefix == b"-":
+            err = prefix + _read_line(sock)
+            raise RuntimeError(f"Redis GET failed: {err!r}")
+        if prefix == b"+":
+            # Simple string reply (unexpected for GET, but handle)
+            return (prefix + _read_line(sock))[1:-2]
+        if prefix == b":":
+            # Integer reply (unexpected for GET, but handle)
+            return (prefix + _read_line(sock))[1:-2]
+        raise RuntimeError(f"Unexpected Redis reply prefix: {prefix!r}")
 
 
 def _require_tool(name: str) -> str:
@@ -307,6 +353,24 @@ def _publish_offline(
     message: str = "OFFLINE - AWAITING STREAM",
 ) -> None:
     os.makedirs(out_dir, exist_ok=True)
+
+    preserve_last_good = os.getenv("ZOMBIE_SHOT_PRESERVE_LAST_GOOD", "1").strip().lower() in {"1", "true", "yes"}
+    if preserve_last_good:
+        try:
+            cur_b64 = redis_get(redis_url, redis_key)
+            if cur_b64:
+                cur_raw = base64.b64decode(cur_b64, validate=True)
+                if cur_raw[:6] in (b"GIF87a", b"GIF89a"):
+                    # Keep last-known-good GIF in place; still publish OFFLINE status keys.
+                    _safe_redis_set_text(redis_url, VISUAL_STREAM_KEY, VISUAL_STREAM_OFFLINE)
+                    _safe_set_visual_status(redis_url, VISUAL_STATUS_OFFLINE)
+                    _safe_redis_set_text(redis_url, VISUAL_STDDEV_KEY, "0")
+                    logger.info("OFFLINE: preserving last-known-good GIF in Redis (%s)", redis_key)
+                    return
+        except Exception:
+            # If anything about the preserve check fails, fall back to publishing the offline placeholder.
+            pass
+
     png_path = os.path.join(out_dir, "zombie_offline.png")
     jpg_path = os.path.join(out_dir, "zombie_offline.jpg")
 
@@ -436,7 +500,8 @@ def capture_once(
     redis_set(redis_url, redis_key, b64)
 
     _safe_redis_set_text(redis_url, VISUAL_STREAM_KEY, VISUAL_STREAM_OK)
-    _safe_set_visual_status(redis_url, VISUAL_STATUS_DEFAULT)
+    # If the screenshot is live (capture+publish succeeded), mark the visual gate VERIFIED.
+    _safe_set_visual_status(redis_url, VISUAL_STATUS_LIVE)
 
     logger.info("Published screenshot: %d bytes -> %d b64 bytes (via %s)", len(raw), len(b64), captured_via)
 
@@ -511,7 +576,8 @@ def capture_gif_once(
     b64 = base64.b64encode(raw)
     redis_set(redis_url, redis_key, b64)
     _safe_redis_set_text(redis_url, VISUAL_STREAM_KEY, VISUAL_STREAM_OK)
-    _safe_set_visual_status(redis_url, VISUAL_STATUS_DEFAULT)
+    # If the screenshot is live (capture+publish succeeded), mark the visual gate VERIFIED.
+    _safe_set_visual_status(redis_url, VISUAL_STATUS_LIVE)
     logger.info("Published screenshot GIF: %d bytes -> %d b64 bytes (%d frames)", len(raw), len(b64), len(png_paths))
 
 
