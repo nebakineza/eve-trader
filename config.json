@@ -1,0 +1,30 @@
+{
+  "model": {
+    "architecture": "Oracle-LSTM-12D",
+    "d_coefficient": 0.4,
+    "lookback_horizon": 15,
+    "features": [
+      "OBI",
+      "Z_Score",
+      "Demand_Shift",
+      "FracDiff_Price",
+      "Volume_Imbalance",
+      "Spread_Efficiency"
+    ]
+  },
+  "risk": {
+    "z_score_threshold": 1.96,
+    "slippage_penalty_isk": 0.05,
+    "stop_loss_pct": 2.5,
+    "confidence_threshold": 0.35
+  },
+  "market": {
+    "region_id": 10000002,
+    "bucket_minutes": 5,
+    "obi_levels": 5
+  },
+  "system": {
+    "log_level": "INFO",
+    "disk_guard_enabled": true
+  }
+}

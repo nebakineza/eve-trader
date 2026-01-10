@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ZombieShot every 60 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=zombie-shot.service
+
+[Install]
+WantedBy=timers.target

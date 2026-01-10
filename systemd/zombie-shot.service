@@ -1,0 +1,20 @@
+[Unit]
+Description=EVE Trader ZombieShot (publish DISPLAY=:1 screenshot to Redis)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=seb
+WorkingDirectory=/home/seb/nebakineza/eve-trader
+Environment=DISPLAY=:1
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=REDIS_URL=redis://127.0.0.1:6379/0
+Environment=ZOMBIE_SHOT_REDIS_KEY=system:zombie:screenshot
+Environment=ZOMBIE_SHOT_OUT_DIR=/tmp/eve-trader
+Environment=ZOMBIE_SHOT_JPG_QUALITY=55
+Environment=ZOMBIE_SHOT_MIN_JPG_BYTES=51200
+ExecStart=/usr/bin/python3 /home/seb/nebakineza/eve-trader/scripts/zombie_shot.py --auto-display --display-candidates :1,:0 --display :1 --redis-url redis://127.0.0.1:6379/0 --redis-key system:zombie:screenshot --out-dir /tmp/eve-trader --jpg-quality 55 --min-jpg-bytes 51200
+StandardOutput=journal
+StandardError=journal
+

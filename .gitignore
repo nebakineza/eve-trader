@@ -1,0 +1,38 @@
+.venv-blackwell/
+.venv-oracle/
+oracle_v1.pth
+*.pt
+zombie_root.png
+*.png
+*.log
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual env
+.venv/
+venv/
+ENV/
+
+# OS/editor
+.DS_Store
+.vscode/
+
+# Local env
+.env
+.env.*
+.venv_recovery/
+
+# Local data / state
+pgdata/
+data/
+
+# Training artifacts
+models/
+training_data*.parquet
+
+# Logs
+*.log
+*.pid
+logs/
