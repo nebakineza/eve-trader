@@ -19,6 +19,11 @@ ENV/
 .DS_Store
 .vscode/
 
+# Local env
+.env
+.env.*
+.venv_recovery/
+
 # Local data / state
 pgdata/
 data/
@@ -29,6 +34,8 @@ training_data*.parquet
 
 # Logs
 *.log
+*.pid
+logs/
 
 # Local scratch / runtime state
 logs/
