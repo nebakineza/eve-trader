@@ -226,11 +226,18 @@ fi
 # - If EVE_USER/EVE_PASS are set, inject credentials into the login window.
 # - When Character Selection appears, send Return to enter the world.
 
-LAUNCHER_CONTROL_SCRIPT="${LAUNCHER_CONTROL_SCRIPT:-$HOME/eve-trader/scripts/launcher_control.py}"
-ZOMBIE_CREDS_SCRIPT="${ZOMBIE_CREDS_SCRIPT:-$HOME/eve-trader/scripts/zombie_creds.sh}"
-ZOMBIE_OTP_SCRIPT="${ZOMBIE_OTP_SCRIPT:-$HOME/eve-trader/scripts/zombie_otp.sh}"
-ZOMBIE_EULA_SCRIPT="${ZOMBIE_EULA_SCRIPT:-$HOME/eve-trader/scripts/clear_prompts.sh}"
-ZOMBIE_EULA_BRIDGE_SCRIPT="${ZOMBIE_EULA_BRIDGE_SCRIPT:-$HOME/eve-trader/scripts/clear_prompts_bridge.sh}"
+# Repo root (avoid hard-coded $HOME/eve-trader assumptions)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+LAUNCHER_CONTROL_SCRIPT="${LAUNCHER_CONTROL_SCRIPT:-$REPO_ROOT/scripts/launcher_control.py}"
+ZOMBIE_CREDS_SCRIPT="${ZOMBIE_CREDS_SCRIPT:-$REPO_ROOT/scripts/zombie_creds.sh}"
+ZOMBIE_OTP_SCRIPT="${ZOMBIE_OTP_SCRIPT:-$REPO_ROOT/scripts/zombie_otp.sh}"
+ZOMBIE_EULA_SCRIPT="${ZOMBIE_EULA_SCRIPT:-$REPO_ROOT/scripts/clear_prompts.sh}"
+ZOMBIE_EULA_BRIDGE_SCRIPT="${ZOMBIE_EULA_BRIDGE_SCRIPT:-$REPO_ROOT/scripts/clear_prompts_bridge.sh}"
+
+# Dashboard expects this file under the repo bind-mount (/app/logs/launcher_stdout.log).
+LAUNCHER_STDOUT_LOG_PATH="${LAUNCHER_STDOUT_LOG_PATH:-$REPO_ROOT/logs/launcher_stdout.log}"
+mkdir -p "$(dirname "$LAUNCHER_STDOUT_LOG_PATH")"
 
 ZOMBIE_LAUNCHER_POLL_SECONDS="${ZOMBIE_LAUNCHER_POLL_SECONDS:-60}"
 ZOMBIE_CREDS_POLL_SECONDS="${ZOMBIE_CREDS_POLL_SECONDS:-5}"
@@ -256,7 +263,7 @@ elif [ -f "$LAUNCHER_CONTROL_SCRIPT" ] && [ "$EVE_TARGET_EXE" != "$EVE_EXE" ]; t
             --launcher-window-pattern "$ZOMBIE_LAUNCHER_WINDOW_PATTERN" \
             --client-proc-pattern "$ZOMBIE_CLIENT_PROC_PATTERN" \
             --click \
-            > /tmp/launcher_control.log 2>&1 &
+            >> "$LAUNCHER_STDOUT_LOG_PATH" 2>&1 &
         echo $! > /tmp/launcher_control.pid
         echo "[ok] launcher_control started pid=$(cat /tmp/launcher_control.pid)"
     fi
