@@ -45,24 +45,47 @@ def _read_gpu_metrics() -> tuple[str, str, str]:
     return temp, util, mem_used
 
 
+def tile_oracle_logs() -> str:
+    # Only relevant for Blackwell/SkyNet host
+    log_path = "/app/logs/oracle_uvicorn.log"
+    if not os.path.exists(log_path):
+        return ""
+    try:
+        cmd = ["tail", "-n", "20", log_path]
+        res = subprocess.run(cmd, text=True, capture_output=True)
+        return res.stdout
+    except:
+        return ""
+
 def main() -> None:
-    interval_s = int(os.getenv("GPU_LOGGER_INTERVAL_SECONDS", "30"))
+    interval_s = int(os.getenv("GPU_LOGGER_INTERVAL_SECONDS", "5"))
+    prefix = os.getenv("GPU_METRIC_PREFIX", "system:p4000")
     r = _redis_client()
 
-    logger.info("P4000 telemetry logger started (interval=%ss)", interval_s)
+    logger.info(f"GPU telemetry logger started for {prefix} (interval={interval_s}s)")
 
     while True:
+        # SkyNet Telemetry: Oracle Logs (Priority)
+        if "skynet" in prefix:
+             try:
+                 logs = tile_oracle_logs()
+                 if logs:
+                     r.set("system:oracle:logs", logs)
+             except Exception as e:
+                 logger.warning("Failed to tile oracle logs: %s", e)
+
+        # GPU Metrics (Best Effort)
         try:
             temp, util, mem_used = _read_gpu_metrics()
-            r.set("system:p4000:temp", temp)
-            r.set("system:p4000:load", util)
-            r.set("system:p4000:vram", mem_used)
-            r.set("system:p4000:last_update", str(int(time.time())))
-            logger.info("Updated P4000 metrics: temp=%sC util=%s%% vram=%sMiB", temp, util, mem_used)
+            r.set(f"{prefix}:temp", temp)
+            r.set(f"{prefix}:load", util)
+            r.set(f"{prefix}:vram", mem_used)
+            logger.info("Updated metrics: temp=%sC util=%s%%", temp, util)
         except Exception as e:
-            # Keep last good Redis values; just report the issue.
-            logger.warning("Failed to read P4000 metrics: %s", e)
-        time.sleep(max(5, interval_s))
+            # If GPU is missing or driver failed, just log it but keep the loop alive for logs
+            logger.warning("Failed to read GPU metrics: %s", e)
+
+        time.sleep(max(1, interval_s))
 
 
 if __name__ == "__main__":

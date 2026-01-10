@@ -1,36 +1,52 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+set -e
 
-# Installs and enables the eve-trader-disk-guard timer on a Debian/Ubuntu host.
-# This enforces a 48h retention and a hard guard to keep ./data from growing
-# beyond 75% of total disk capacity.
+echo "🛡️ Installing EVE Disk Guard System..."
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-need() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "[!] Missing required command: $1" >&2
-    exit 1
-  }
-}
+# 1. Install Script
+echo "Copying script..."
+# Ensure the script is executable
+chmod +x "${REPO_ROOT}/scripts/disk_guard.py"
+# Link it securely
+sudo ln -sf "${REPO_ROOT}/scripts/disk_guard.py" /usr/local/bin/eve-disk-guard
 
-need systemctl
-need sudo
-need python3
+# 2. Create Service
+echo "Creating Systemd Service..."
+cat <<SERVICE | sudo tee /etc/systemd/system/eve-disk-guard.service
+[Unit]
+Description=EVE Trader Disk Space Guardian
+After=docker.service
 
-SYSTEMD_DIR="/etc/systemd/system"
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/eve-disk-guard
+User=root
+# Group=docker
+SERVICE
 
-echo "[*] Repo: $REPO_DIR"
-echo "[*] Installing systemd units to $SYSTEMD_DIR ..."
+# 3. Create Timer
+echo "Creating Systemd Timer..."
+cat <<TIMER | sudo tee /etc/systemd/system/eve-disk-guard.timer
+[Unit]
+Description=Run EVE Disk Guard every 10 minutes
 
-sudo install -m 0644 "$REPO_DIR/systemd/eve-trader-disk-guard.service" "$SYSTEMD_DIR/eve-trader-disk-guard.service"
-sudo install -m 0644 "$REPO_DIR/systemd/eve-trader-disk-guard.timer" "$SYSTEMD_DIR/eve-trader-disk-guard.timer"
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Unit=eve-disk-guard.service
 
-echo "[*] Reloading systemd and enabling timer..."
+[Install]
+WantedBy=timers.target
+TIMER
+
+# 4. Enable and Start
+echo "Enabling Timer..."
 sudo systemctl daemon-reload
-sudo systemctl enable --now eve-trader-disk-guard.timer
+sudo systemctl enable eve-disk-guard.timer
+sudo systemctl start eve-disk-guard.timer
+sudo systemctl start eve-disk-guard.service  # Run once immediately
 
-echo "[*] Status:"
-sudo systemctl status eve-trader-disk-guard.timer --no-pager || true
-
-echo "[+] Installed. Check logs with: journalctl -u eve-trader-disk-guard.service -n 200 --no-pager"
+echo "✅ Disk Guard Active!"

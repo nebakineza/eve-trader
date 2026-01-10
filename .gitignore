@@ -29,3 +29,14 @@ training_data*.parquet
 
 # Logs
 *.log
+
+# Local scratch / runtime state
+logs/
+local/
+config.json
+*.pid
+*.bak
+
+# Local virtualenv variants
+.venv-*/
+.venv-*

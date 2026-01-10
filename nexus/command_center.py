@@ -1,3 +1,4 @@
+print("Oracle Mind module initialized", flush=True)
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -31,14 +32,23 @@ st.title("EVE Online Station Trader - Command Center")
 @st.cache_data(ttl=3600)
 def resolve_type_names(type_ids):
     if not type_ids: return {}
+    # Avoid stalling the dashboard on extremely large batches.
+    max_ids = int(os.getenv("ESI_RESOLVE_MAX_IDS", "200"))
     url = "https://esi.evetech.net/latest/universe/names/"
-    ids = list(set([int(x) for x in type_ids]))
+    try:
+        ids = list(set([int(x) for x in type_ids if x is not None]))
+    except Exception:
+        ids = []
+    if not ids:
+        return {}
+    if len(ids) > max_ids:
+        ids = ids[:max_ids]
     mapping = {}
     chunk_size = 900 
     for i in range(0, len(ids), chunk_size):
         chunk = ids[i:i + chunk_size]
         try:
-            resp = requests.post(url, json=chunk)
+            resp = requests.post(url, json=chunk, timeout=5)
             if resp.status_code == 200:
                 for item in resp.json():
                     mapping[str(item['id'])] = item['name']
@@ -58,11 +68,15 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-refresh_tick = st_autorefresh(interval=60 * 1000, key="datarefresh")
+refresh_interval_ms = int(os.getenv("STREAMLIT_REFRESH_MS", "10000"))
+refresh_tick = None
+if refresh_interval_ms > 0:
+    refresh_tick = st_autorefresh(interval=refresh_interval_ms, key="datarefresh")
 
 # Quick operator-visible confirmation of refresh cadence.
 try:
-    st.sidebar.caption(f"Refresh tick: {int(refresh_tick)}")
+    if refresh_tick is not None:
+        st.sidebar.caption(f"Refresh tick: {int(refresh_tick)}")
 except Exception:
     pass
 
@@ -93,7 +107,7 @@ def get_hypertable_sizes_df() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
-def get_resolved_trades_df(outcome_filter: str, limit: int = 50, horizon_minutes: int = 60) -> pd.DataFrame:
+def get_resolved_trades_df(outcome_filter: str, limit: int = 100, horizon_minutes: int = 1440) -> pd.DataFrame:
     if not db_engine:
         return pd.DataFrame()
     
@@ -330,107 +344,8 @@ def _read_macro_history(*, redis_client, key: str, max_points: int) -> pd.Series
         return pd.Series(dtype="float64")
 
 
-def read_eve_client_rsync_tail(lines: int = 3) -> str:
-    """Best-effort: local log path, else optional SSH tail."""
-    log_path = os.getenv("EVE_CLIENT_RSYNC_LOG_PATH", "/tmp/eve_client_rsync.log")
-    tail = _tail_text_file(log_path, lines=lines)
-    if tail:
-        return tail
-
-    # Optional: allow pulling from a remote host if the dashboard isn't running on Skynet.
-    # Example: export EVE_CLIENT_RSYNC_LOG_SSH='seb@SKYNET'
-    ssh_host = os.getenv("EVE_CLIENT_RSYNC_LOG_SSH", "").strip()
-    if not ssh_host:
-        return ""
-
-    try:
-        import subprocess
-
-        cmd = [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=3",
-            ssh_host,
-            f"tail -n {int(lines)} {log_path} 2>/dev/null || true",
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        return (res.stdout or "").strip()
-    except Exception:
-        return ""
 
 
-def parse_rsync_progress_from_tail(tail: str):
-    """Parse rsync --info=progress2 lines to (percent, speed, eta)."""
-    if not tail:
-        return None
-    last = ""
-    for line in tail.splitlines()[::-1]:
-        if "%" in line and "(" in line:
-            last = line.strip()
-            break
-    if not last:
-        return None
-
-    # Example:
-    # 100,629,169   2%   39.09MB/s    0:00:02 (xfr#342, ir-chk=1314/11517)
-    m = re.search(
-        r"\s(?P<pct>\d{1,3})%\s+(?P<speed>\S+)\s+(?P<eta>\d+:\d\d:\d\d|\d+:\d\d)\s+\(",
-        last,
-    )
-    if not m:
-        return None
-    try:
-        pct = max(0, min(100, int(m.group("pct"))))
-    except Exception:
-        pct = None
-    return {
-        "percent": pct,
-        "speed": m.group("speed"),
-        "eta": m.group("eta"),
-        "raw": last,
-    }
-
-
-def render_eve_client_sync_status():
-    tail = read_eve_client_rsync_tail(lines=3)
-    info = parse_rsync_progress_from_tail(tail)
-
-    if not tail:
-        st.info("📂 Status: Awaiting Client Upload to `~/eve-client`.")
-        st.markdown("📦 Syncing EVE Client: *(no rsync log visible)*")
-        return
-
-    if not info or info.get("percent") is None:
-        st.info("📂 Status: Awaiting Client Upload to `~/eve-client`.")
-        st.markdown("📦 Syncing EVE Client: *(parsing pending)*")
-        st.code(tail)
-        return
-
-    percent = int(info["percent"])
-    if percent >= 100:
-        st.success("✅ Client Data Verified: Ready for Zombie Boot.")
-
-        if not st.session_state.get("client_sync_ready_notified", False):
-            try:
-                st.toast("✅ Client Data Verified: Ready for Zombie Boot.")
-            except Exception:
-                pass
-            st.session_state["client_sync_ready_notified"] = True
-    else:
-        st.info("📂 Status: Awaiting Client Upload to `~/eve-client`.")
-
-    blocks = 10
-    filled = max(0, min(blocks, int(round((percent / 100) * blocks))))
-    bar = ("█" * filled) + ("░" * (blocks - filled))
-
-    st.markdown(f"📦 Syncing EVE Client: [{bar}] {percent}% (ETA: {info['eta']})")
-    try:
-        st.progress(percent / 100)
-    except Exception:
-        pass
-    st.caption(f"Speed: {info['speed']}")
 
 # --- Redis Connection ---
 @st.cache_resource
@@ -448,9 +363,10 @@ except Exception as e:
     r = None
 
 # --- DB Connection & Monitor ---
-# HARD-CODED CONNECTION - NO ENV VARS
+# EDITED: PREFER ENV VAR, FALLBACK TO HARDCODED
 try:
-    db_engine = sqlalchemy.create_engine('postgresql://eve_user:eve_pass@db:5432/eve_market_data')
+    db_url = os.getenv("DATABASE_URL", "postgresql://eve_user:eve_pass@db:5432/eve_market_data")
+    db_engine = sqlalchemy.create_engine(db_url)
     @st.cache_data(ttl=120)
     def get_market_orders_count():
         try:
@@ -525,7 +441,7 @@ st.sidebar.markdown("---")
 st.sidebar.header("Hardware Bridge")
 
 # Hardware Lock toggle (prevents Arduino bridge from sending serial commands until enabled)
-hardware_lock_state = st.sidebar.toggle("HARDWARE_LOCK", value=True, help="When enabled (locked), the Arduino bridge will NOT send serial commands. Disable to arm the hardware.")
+hardware_lock_state = st.sidebar.toggle("HARDWARE_LOCK", value=False, help="When enabled (locked), the Arduino bridge will NOT send serial commands. Disable to arm the hardware.")
 if r:
     r.set("system:hardware_lock", "true" if hardware_lock_state else "false")
     lock_msg = "🔒 LOCKED (safe)" if hardware_lock_state else "🔓 UNLOCKED (armed)"
@@ -556,8 +472,17 @@ raw_items = []
 name_map = {}
 
 if r:
-    keys = r.keys("features:*")
-    keys = [k for k in keys if len(k.split(":")) == 2]
+    max_feature_keys = int(os.getenv("FEATURES_MAX_KEYS", "500"))
+    keys = []
+    try:
+        # IMPORTANT: avoid Redis KEYS (blocks server). Use bounded SCAN.
+        for k in r.scan_iter(match="features:*", count=200):
+            if len(str(k).split(":")) == 2:
+                keys.append(k)
+            if len(keys) >= max_feature_keys:
+                break
+    except Exception:
+        keys = []
     
     ids_to_resolve = []
     for k in keys:
@@ -566,7 +491,7 @@ if r:
             if val:
                 obj = json.loads(val)
                 raw_items.append(obj)
-                ids_to_resolve.append(obj.get('type_id'))
+                # Delay name resolution until we know what we'll display.
         except: pass
     
     def alpha_score(item):
@@ -574,7 +499,9 @@ if r:
 
     raw_items.sort(key=alpha_score, reverse=True)
     top_5 = raw_items[:5]
-    
+
+    # Resolve only what we actually display to keep load bounded.
+    ids_to_resolve = [i.get("type_id") for i in top_5 if i.get("type_id") is not None]
     name_map = resolve_type_names(ids_to_resolve)
     
     for item in top_5:
@@ -629,8 +556,10 @@ with tab_radar:
     with col_live:
         st.header("Live Market Feed")
         if raw_items:
+            # Keep UI responsive if Redis contains many feature keys.
+            max_rows = int(os.getenv("FEATURES_MAX_ROWS", "200"))
             market_data = []
-            for obj in raw_items:
+            for obj in raw_items[:max_rows]:
                 tid = str(obj.get("type_id"))
                 name = name_map.get(tid, tid)
                 price = float(obj.get("price", 0))
@@ -772,6 +701,27 @@ with tab_oracle:
                                     pass
         except Exception:
             pass
+
+    # Directive 4: Alpha Ledger Cleanup (Fallback to Disk Metadata)
+    if train_r2 == 0.0 and loss_last == 0.0:
+        try:
+            import torch
+            from pathlib import Path
+            root_dir = Path(__file__).resolve().parents[1]
+            live_pt = root_dir / "oracle_v1.pth"
+            
+            if live_pt.exists():
+                # Load on CPU to avoid CUDA overhead on dashboard
+                checkpoint = torch.load(live_pt, map_location='cpu')
+                if isinstance(checkpoint, dict):
+                    meta = checkpoint.get('metadata', {})
+                    if meta:
+                        train_r2 = float(meta.get('train_r2', 0.0))
+                        val_r2 = float(meta.get('val_r2', 0.0))
+                        prev_val_r2 = float(meta.get('baseline_val_r2', 0.0))
+                        loss_last = float(meta.get('best_val_loss', 0.0))
+        except Exception:
+            pass # Keep as 0.0 if fail
 
     # Next training session countdown (based on 4h cron schedule)
     next_training_eta = "N/A"
@@ -976,9 +926,25 @@ with tab_fundamentals:
         warfare_updated_at_raw = r.get("system:macro:warfare:updated_at")
         warfare_source = r.get("system:macro:warfare:source")
 
-        jita_jumps_raw = r.get("system:macro:jita:ship_jumps")
-        jita_ship_kills_raw = r.get("system:macro:jita:ship_kills")
-        jita_pod_kills_raw = r.get("system:macro:jita:pod_kills")
+        try:
+            # Inline sticky helper for this block scope if not globally available
+            if "sticky_get_wrapper" not in locals():
+                def sticky_get_wrapper(k, conn):
+                    v = conn.get(k)
+                    if v is not None:
+                        st.session_state[f"stk_{k}"] = v
+                        return v
+                    return st.session_state.get(f"stk_{k}")
+            
+            jita_jumps_raw = sticky_get_wrapper("system:macro:jita:ship_jumps", r)
+            jita_ship_kills_raw = sticky_get_wrapper("system:macro:jita:ship_kills", r)
+            jita_pod_kills_raw = sticky_get_wrapper("system:macro:jita:pod_kills", r)
+        except:
+             # Fallback if wrapper fails
+             jita_jumps_raw = r.get("system:macro:jita:ship_jumps")
+             jita_ship_kills_raw = r.get("system:macro:jita:ship_kills")
+             jita_pod_kills_raw = r.get("system:macro:jita:pod_kills")
+
         jita_updated_at_raw = r.get("system:macro:jita:updated_at")
     except Exception:
         players_raw = None
@@ -1276,6 +1242,35 @@ with tab_fundamentals:
     else:
         st.caption("🔄 Mean Reversion Potential: Low")
 
+    # TODO 5: Z-Score Visualization (Tritanium Monitoring)
+    try:
+        if r:
+            # Tritanium TypeID = 34
+            trit_features = r.get("features:34")
+            if trit_features:
+                feats = json.loads(trit_features)
+                price_hist = feats.get("price_history", [])
+                
+                if price_hist and len(price_hist) > 5:
+                     # Calculate live Z-Score on dashboard
+                     last_p = price_hist[-1]
+                     arr = np.array(price_hist)
+                     z_val = (last_p - arr.mean()) / (arr.std() + 1e-8)
+                     
+                     st.metric(
+                         "🛡️ Tritanium Z-Score (Volatility Shield)", 
+                         f"{z_val:.2f} σ",
+                         delta="HALT RISK" if abs(z_val) > 1.96 else "Stable",
+                         delta_color="inverse"
+                     )
+                     
+                     st.line_chart(price_hist[-15:])
+                     st.caption(f"Tritanium Lookback ({len(price_hist)} points)")
+            else:
+                 st.info("Waiting for Tritanium (34) history...")
+    except Exception as e:
+        st.caption(f"Z-Score Viz Error: {e}")
+
     st.markdown(f"**Model Status:** {model_status}")
     if last_metrics:
         st.json(last_metrics)
@@ -1296,6 +1291,60 @@ with tab_fundamentals:
             st.plotly_chart(fig_imp, use_container_width=True)
     except Exception as e:
         st.error(f"Feature impact chart error: {e}")
+
+    # TODO 5: Kelly Sizing Accuracy Check (Projections)
+    st.divider()
+    st.subheader("🎲 Kelly Profit Projection (Top 3 Targets)")
+    if r:
+         try:
+             # Scan Redis for top opportunities
+             keys = r.keys("market_radar:*")
+             top_ops = []
+             for k in keys:
+                 raw = r.get(k)
+                 if raw:
+                     d = json.loads(raw)
+                     # Only consider valid signals
+                     if d.get("confidence", 0) > 0.5:
+                         top_ops.append(d)
+             
+             # Sort by Kelly Fraction descending
+             top_ops.sort(key=lambda x: x.get("kelly_fraction", 0), reverse=True)
+             
+             cols = st.columns(3)
+             for i, op in enumerate(top_ops[:3]):
+                 # E[V] = (p * win) - (q * loss)
+                 # win = predicted - current
+                 # loss = 2 * sigma (approx risk metric used in strategy)
+                 
+                 curr = float(op.get("price", 0))
+                 pred = float(op.get("predicted", 0))
+                 conf = float(op.get("confidence", 0))
+                 kelly = float(op.get("kelly_fraction", 0))
+                 
+                 win = pred - curr
+                 # Reconstruct volatility estimate from stop loss or default
+                 stop_loss = float(op.get("stop_loss_price", 0))
+                 if stop_loss > 0:
+                     loss = curr - stop_loss
+                 else:
+                     loss = curr * 0.05 # Default if missing
+                     
+                 ev = (conf * win) - ((1-conf) * loss)
+                 
+                 with cols[i]:
+                     st.metric(
+                         f"TypeID {op.get('type_id')}",
+                         f"{kelly*100:.1f}% Size",
+                         f"EV: {ev:,.0f} ISK",
+                         delta_color="normal"
+                     )
+             
+             if not top_ops:
+                 st.info("No high-confidence targets for Kelly Projection.")
+
+         except Exception as e:
+             st.caption(f"Kelly Projection Error: {e}")
 
     # 📈 Accuracy Sparkline: predicted return vs actual market return (last 12 buckets)
     st.divider()
@@ -1394,6 +1443,50 @@ with tab_fundamentals:
 with tab_performance:
     st.markdown("### 📈 Performance Audit")
 
+    # Directive B+: Calibration Engine (Platt Scaling Prep)
+    if db_engine:
+        try:
+            # Fetch deeper history for statistical significance (500 trades)
+            calib_df = get_shadow_trade_outcomes_df(limit=500, horizon_minutes=60, fee_rate=0.025)
+            
+            if not calib_df.empty:
+                # Data cleanup
+                c_df = calib_df.copy()
+                c_df["entry_price"] = pd.to_numeric(c_df["entry_price"], errors="coerce")
+                c_df["exit_price"] = pd.to_numeric(c_df["exit_price"], errors="coerce")
+                c_df["confidence"] = pd.to_numeric(c_df["confidence"], errors="coerce")
+                
+                # Filter valid closed trades
+                closed_trades = c_df.dropna(subset=['entry_price', 'exit_price'])
+                
+                if len(closed_trades) > 10:
+                    # Calculate Net PnL (assuming Long-only for simplicity or matching signal)
+                    # PnL = (Exit * (1-fee)) - (Entry * (1+fee))
+                    fee_r = 0.025
+                    closed_trades['net_pnl'] = (closed_trades['exit_price'] * (1 - fee_r)) - (closed_trades['entry_price'] * (1 + fee_r))
+                    
+                    win_count = len(closed_trades[closed_trades['net_pnl'] > 0])
+                    total_count = len(closed_trades)
+                    realized_wr = win_count / total_count
+                    
+                    avg_conf = closed_trades['confidence'].mean()
+                    gap = avg_conf - realized_wr
+                    
+                    st.caption(f"🤖 Calibration Engine (n={total_count} trades)")
+                    cc1, cc2, cc3 = st.columns(3)
+                    cc1.metric("Avg Confidence (Predicted)", f"{avg_conf:.1%}")
+                    cc2.metric("Realized Win Rate", f"{realized_wr:.1%}")
+                    cc3.metric("Calibration Gap", f"{gap:+.1%}", 
+                             delta="-Optimism" if gap > 0 else "+Pessimism", 
+                             delta_color="inverse" if gap > 0.1 else "normal")
+                    
+                    if gap > 0.10:
+                        st.warning(f"⚠️ Optimism Bias Detected. Gap {gap:.1%}. Dynamic Shrinkage would target factor: {realized_wr/avg_conf:.2f}")
+                    st.divider()
+        except Exception as e:
+            # st.error(f"Calibration Error: {e}")
+            pass
+
     # Trade Performance Table (color-coded)
     if db_engine:
         try:
@@ -1442,24 +1535,36 @@ with tab_performance:
                 st.dataframe(styled, use_container_width=True, height=300)
 
                 # Winner's Ledger: per-trade reasoning + outcome color.
-                st.subheader("Trading Ledger")
+                st.subheader("Market Maker Ledger") # Renamed from Trading Ledger
                 try:
                     # Resolve item names
                     type_ids = [int(x) for x in dfp["type_id"].dropna().astype(int).tolist()]
                     type_names = resolve_type_names(type_ids)
                     ledger = dfp.copy()
                     ledger["item_name"] = ledger["type_id"].apply(lambda x: type_names.get(str(int(x)), f"Type {int(x)}") if pd.notna(x) else "Unknown")
-                    ledger["reasoning"] = ledger.get("reasoning")
                     
                     # Columns aligned with EVE Wallet
-                    ledger_cols = {
-                        "timestamp": "Timestamp", 
-                        "item_name": "Item", 
-                        "entry_price": "Price (Entry)", 
-                        "profit_net": "Net ISK", 
-                        "status": "Status",
-                        "reasoning": "Strategy Logic"
-                    }
+                    ledger_cols = ["timestamp", "item_name", "entry_price", "exit_price", "profit_net", "reasoning"]
+                    
+                    # Create Tabs
+                    tab_wins, tab_loss = st.tabs(["🏆 Winners", "📉 Losers"])
+                    
+                    with tab_wins:
+                         wins_df = ledger[ledger['profit_net'] > 0]
+                         if not wins_df.empty:
+                             st.dataframe(wins_df[ledger_cols].style.format({"profit_net": "{:,.2f}"}), use_container_width=True)
+                         else:
+                             st.info("No wins yet.")
+
+                    with tab_loss:
+                         loss_df = ledger[ledger['profit_net'] <= 0]
+                         if not loss_df.empty:
+                             st.dataframe(loss_df[ledger_cols].style.format({"profit_net": "{:,.2f}"}), use_container_width=True)
+                         else:
+                             st.success("No losses recorded.")
+                             
+                except Exception as e:
+                    st.error(f"Ledger error: {e}")
                     
                     # Filter for Winners/Losers Tabs
                     tab_w, tab_l = st.tabs(["🏆 Winners", "📉 Losers"])
@@ -1899,11 +2004,18 @@ with tab_system:
         z_vram = "0/8GB"
         
         if r:
+            def sticky_get(k, conn):
+                v = conn.get(k)
+                if v is not None:
+                    st.session_state[f"stk_{k}"] = v
+                    return v
+                return st.session_state.get(f"stk_{k}")
+
             # Preferred: direct P4000 keys (gpu_logger)
             try:
-                t = r.get("system:p4000:temp")
-                u = r.get("system:p4000:load")
-                m = r.get("system:p4000:vram")
+                t = sticky_get("system:p4000:temp", r)
+                u = sticky_get("system:p4000:load", r)
+                m = sticky_get("system:p4000:vram", r)
                 if t is not None:
                     z_gpu_temp = f"{t}°C"
                 if u is not None:
@@ -1935,9 +2047,9 @@ with tab_system:
         s_vram = "0 MiB"
         if r:
             try:
-                t = r.get("system:skynet:temp")
-                u = r.get("system:skynet:load")
-                m = r.get("system:skynet:vram")
+                t = sticky_get("system:skynet:temp", r)
+                u = sticky_get("system:skynet:load", r)
+                m = sticky_get("system:skynet:vram", r)
                 if t is not None:
                     s_temp = f"{t}°C"
                 if u is not None:
@@ -1951,91 +2063,54 @@ with tab_system:
         c4.metric("5090 Temp", s_temp)
         c5.metric("5090 Load", s_load)
         c6.metric("5090 VRAM", s_vram)
-
-        render_eve_client_sync_status()
+        
+        # render_eve_client_sync_status() REMOVED
         
         st.markdown("**Visual Verification (Live Frame):**")
-        st.caption("To engage the physical execution layer, set HARDWARE_LOCK to OFF (UNLOCKED/armed) in the sidebar.")
+        st.caption("To engage the physical execution layer, ensure HARDWARE_LOCK is OFF (UNLOCKED/armed).")
 
-        if r:
-            try:
-                shot_b64 = r.get("system:zombie:screenshot")
-            except Exception:
+        refresh_seconds = int(os.getenv("ZOMBIE_SHOT_VIEW_REFRESH_SECONDS", "5"))
+        fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+
+        def _render_zombieshot_media_once():
+            if r:
+                try:
+                    shot_b64 = r.get("system:zombie:screenshot")
+                except Exception:
+                    shot_b64 = None
+            else:
                 shot_b64 = None
-        else:
-            shot_b64 = None
 
-        if shot_b64:
+            if not shot_b64:
+                st.info(
+                    "No capture yet. Expect updates every few seconds once ZombieShot is running (or per its systemd timer interval)."
+                )
+                return
+
             try:
                 import base64
 
-                img_bytes = base64.b64decode(shot_b64)
+                media_bytes = base64.b64decode(shot_b64)
+                is_gif = media_bytes[:6] in (b"GIF87a", b"GIF89a")
+                caption = "EVE client clip" if is_gif else "EVE client frame"
                 try:
-                    st.image(
-                        img_bytes,
-                        caption="EVE client frame",
-                        use_container_width=True,
-                    )
+                    st.image(media_bytes, caption=caption, use_container_width=True)
                 except TypeError:
-                    st.image(
-                        img_bytes,
-                        caption="EVE client frame",
-                        use_column_width=True,
-                    )
+                    st.image(media_bytes, caption=caption, use_column_width=True)
             except Exception as e:
-                st.warning(f"Screenshot decode failed: {e}")
+                st.warning(f"Capture decode failed: {e}")
+
+        if fragment:
+            @fragment(run_every=timedelta(seconds=max(1, int(refresh_seconds))))
+            def _zombieshot_media_fragment():
+                _render_zombieshot_media_once()
+
+            _zombieshot_media_fragment()
         else:
-            st.info("No screenshot yet. Expect updates every ~60s once ZombieShot is running on the host.")
-
-        st.markdown("**📜 Accept EULA**")
-        if r:
-            c_eula1, c_eula2 = st.columns([1, 3])
-            with c_eula1:
-                do_eula = st.button("📜 Accept EULA", use_container_width=True)
-            with c_eula2:
-                st.caption("Triggers an aggressive host-side EULA bypass (blind-fire) and a standard prompt sweep.")
-
-            if do_eula:
-                try:
-                    # Safety: only allow hardware actions when HARDWARE_LOCK is disabled.
-                    lock_val = r.get("system:hardware_lock")
-                    locked = lock_val is None or str(lock_val).lower() in {"true", "1", "yes"}
-                    if locked:
-                        st.warning("Hardware lock is enabled. Disable HARDWARE_LOCK to send the handshake.")
-                    else:
-                        # Trigger the Arduino hardware handshake (END -> 500ms -> RETURN).
-                        r.setex("system:hardware:handshake", 30, "true")
-
-                        # Visual flush: clear cached screenshot so the next frame shows post-accept state.
-                        r.delete("system:zombie:screenshot")
-
-                        st.success("Hardware handshake sent.")
-                except Exception as e:
-                    st.error(f"Failed to request clearance sweep: {e}")
-        else:
-            st.info("EULA clearance unavailable (Redis not connected).")
-
-        st.markdown("**🔐 OTP Entry**")
-        if r:
-            otp_code = st.text_input("One-time code", type="password", help="Paste the OTP from your authenticator.")
-            c_otp1, c_otp2 = st.columns([1, 3])
-            with c_otp1:
-                do_inject = st.button("Inject", use_container_width=True)
-            with c_otp2:
-                st.caption("Writes OTP to Redis for the host to inject into the client.")
-
-            if do_inject:
-                if not otp_code:
-                    st.warning("Enter an OTP code first.")
-                else:
-                    try:
-                        # Short TTL so stale OTPs don't linger.
-                        r.setex("system:zombie:otp", 120, otp_code)
-                        st.success("OTP queued for injection.")
-                    except Exception as e:
-                        st.error(f"Failed to queue OTP: {e}")
-        else:
-            st.info("OTP injection unavailable (Redis not connected).")
+            # Fallback: relies on the existing page-level refresh cadence.
+            _render_zombieshot_media_once()
+        
+        # UI Purge: Removed EULA and OTP sections per operator directive
 
         # --- Client state indicator (AUTO-ZOMBIE flip) ---
         client_state = None
@@ -2095,6 +2170,17 @@ with tab_system:
                 st.write(_safe_redis_keys(r, "system:*") )
 
         st.divider()
+        st.subheader("🔮 Oracle Mind (Blackwell Logs)")
+        oracle_logs = "Waiting for stream..."
+        if r:
+            try:
+                raw_l = r.get("system:oracle:logs")
+                if raw_l:
+                    oracle_logs = raw_l.decode('utf-8')
+            except: pass
+        st.code(oracle_logs, language="text", line_numbers=True)
+
+        st.divider()
 
         st.subheader("Hypertable Size")
         try:
@@ -2106,6 +2192,25 @@ with tab_system:
         except Exception as e:
             st.error(f"Hypertable size error: {e}")
             
+    st.divider()
+    st.markdown("### 🧟 Zombie Monitor Console (launcher_stdout.log)")
+    log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "launcher_stdout.log")
+    
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r") as f:
+                # Read last 3KB to avoid freezing UI on huge logs
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                read_size = min(size, 10000)
+                f.seek(size - read_size)
+                content = f.read()
+                st.code(content, language="text")
+        except Exception as e:
+            st.error(f"Error reading logs: {e}")
+    else:
+        st.warning(f"Log file not found: {log_path}")
+
     st.divider()
     st.header("Global Debug Stream")
     if db_engine:

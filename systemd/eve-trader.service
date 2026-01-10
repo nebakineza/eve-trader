@@ -5,7 +5,7 @@ After=docker.service
 
 [Service]
 Type=simple
-WorkingDirectory=/home/seb/nebakineza/eve-trader
+WorkingDirectory=%h/eve-trader
 ExecStart=/usr/bin/docker compose up
 ExecStop=/usr/bin/docker compose down
 Restart=always

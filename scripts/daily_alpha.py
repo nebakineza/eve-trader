@@ -94,21 +94,56 @@ def compute_last_24h_alpha(*, db_engine, horizon_minutes: int, fee_rate: float) 
 
     # Per-trade net return (fee applied to profit component)
     buy = df["signal_type"].astype(str).str.upper().eq("BUY")
-    entry = df["entry_price"].to_numpy(dtype=float)
-    exit_ = df["exit_price"].to_numpy(dtype=float)
+    df["gross_r"] = np.where(
+        buy.to_numpy(),
+        (df["exit_price"].to_numpy(dtype=float) - df["entry_price"].to_numpy(dtype=float))
+        / df["entry_price"].to_numpy(dtype=float),
+        (df["entry_price"].to_numpy(dtype=float) - df["exit_price"].to_numpy(dtype=float))
+        / df["entry_price"].to_numpy(dtype=float),
+    )
 
-    gross_r = np.where(buy.to_numpy(), (exit_ - entry) / entry, (entry - exit_) / entry)
-    net_r = gross_r * (1.0 - float(fee_rate))
+    # Filter out clearly invalid returns first (data corruption / bad ticks).
+    filter_lo = float(os.getenv("DAILY_ALPHA_RETURN_FILTER_LO", "-0.95"))
+    filter_hi = float(os.getenv("DAILY_ALPHA_RETURN_FILTER_HI", "5.0"))
+    df = df[np.isfinite(df["gross_r"]) & (df["gross_r"] > filter_lo) & (df["gross_r"] < filter_hi)].copy()
+    if df.empty:
+        return AlphaResult(
+            updated_at=_now_iso(),
+            n_resolved=0,
+            horizon_minutes=int(horizon_minutes),
+            fee_rate=float(fee_rate),
+            geometric_mean_return=0.0,
+            max_drawdown=0.0,
+        )
+
+    df["net_r"] = df["gross_r"].astype(float) * (1.0 - float(fee_rate))
+
+    # Final winsorization: stabilizes metrics without masking systemic issues.
+    winsor_lo = float(os.getenv("DAILY_ALPHA_RETURN_WINSOR_LO", "-0.90"))
+    winsor_hi = float(os.getenv("DAILY_ALPHA_RETURN_WINSOR_HI", "2.0"))
+    df["net_r"] = df["net_r"].clip(lower=winsor_lo, upper=winsor_hi)
+
+    net_r = df["net_r"].to_numpy(dtype=float)
 
     # Geometric mean over per-trade net returns
     one_plus = 1.0 + net_r
     one_plus = np.where(np.isfinite(one_plus), one_plus, 1.0)
-    one_plus = np.clip(one_plus, 1e-9, None)
+    one_plus = np.clip(one_plus, 1e-6, None)
     gmean = float(np.exp(np.mean(np.log(one_plus))) - 1.0) if one_plus.size else 0.0
 
-    # Equity curve from multiplicative returns
-    equity = np.cumprod(one_plus)
-    max_dd = _compute_max_drawdown(equity)
+    # Max drawdown: compute on hourly aggregated returns (more meaningful than per-trade compounding
+    # when many trades overlap across instruments).
+    try:
+        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        buckets = ts.dt.floor("1H")
+        hourly = df.assign(bucket=buckets).groupby("bucket", dropna=True)["net_r"].mean().sort_index()
+        if hourly.empty:
+            max_dd = 0.0
+        else:
+            equity_h = np.cumprod(1.0 + hourly.to_numpy(dtype=float))
+            max_dd = _compute_max_drawdown(equity_h)
+    except Exception:
+        max_dd = 0.0
 
     return AlphaResult(
         updated_at=_now_iso(),

@@ -14,33 +14,21 @@ logger = logging.getLogger("ZombieExec")
 class ZombieExecutionEngine:
     """
     Stealth Execution Node.
-    Routing priority: Hardware HID (Arduino) -> Software HID (xdotool).
+    Hardware-only execution node.
+    Software injection (xdotool) has been removed.
     """
     def __init__(self):
-        self.hid = ArduinoBridge()
-        self.software_fallback = not self.hid.is_active()
-        
-        if self.software_fallback:
-            logger.warning("Hardware HID not found. Engaging Software Simulation (xdotool).")
-        else:
-            logger.info("Hardware HID Active. Stealth Mode Engaged.")
+        baud_rate = int(os.getenv("ARDUINO_BAUD", "9600"))
+        port = os.getenv("ARDUINO_PORT")
+        self.hid = ArduinoBridge(baud_rate=baud_rate, port=port)
+        if not self.hid.is_active():
+            raise RuntimeError("Hardware HID not found. Software injection is disabled.")
+        logger.info("Hardware HID Active. Stealth Mode Engaged.")
 
     def _sleep_jitter(self, min_ms, max_ms):
         """Human-like delay between actions."""
         duration = random.randint(min_ms, max_ms) / 1000.0
         time.sleep(duration)
-
-    def _software_press(self, key_combo):
-        """Fallback using xdotool."""
-        try:
-            # key-down delay isn't easily modifiable in simple xdotool 'key' command 
-            # without complex 'keydown' ... 'keyup' logic.
-            # Using basic 'key' for reliability in fallback mode.
-            cmd = ["xdotool", "search", "--name", "EVE - ", "windowactivate", "--sync", "key", "--delay", "100", key_combo]
-            subprocess.run(cmd, check=True)
-            logger.info(f"Software HID: {key_combo}")
-        except Exception as e:
-            logger.error(f"xdotool failed: {e}")
 
     def send_keystroke(self, command, raw_key=None):
         """
@@ -51,19 +39,7 @@ class ZombieExecutionEngine:
         # Inter-action delay
         self._sleep_jitter(200, 500)
         
-        if not self.software_fallback:
-            # Hardware
-            self.hid.send_command(command)
-        else:
-            # Software
-            if raw_key:
-                self._software_press(raw_key)
-            else:
-                # Infer from command if simple
-                if command == "ENTER": self._software_press("Return")
-                elif command == "TAB": self._software_press("Tab")
-                elif command.startswith("PRESS:"): self._software_press(command.split(":")[1])
-                else: self._software_press(command.lower())
+        self.hid.send_command(command)
 
     # --- Macros ---
 
@@ -79,11 +55,7 @@ class ZombieExecutionEngine:
 
     def type_text(self, text):
         logger.info(f"Macro: Typing '{text}'")
-        if not self.software_fallback:
-            self.hid.send_command(f"TYPE:{text}")
-        else:
-            # xdotool type
-            subprocess.run(["xdotool", "type", "--delay", "100", text])
+        self.hid.send_command(f"TYPE:{text}")
 
     def confirm(self):
         logger.info("Macro: Confirm")

@@ -21,6 +21,10 @@ SWEEP_SCRIPT="${SWEEP_SCRIPT:-$SCRIPT_DIR/clear_prompts.sh}"
 FORCE_REDIS_KEY="${FORCE_REDIS_KEY:-system:zombie:force_entry}"
 FORCE_SCRIPT="${FORCE_SCRIPT:-$SCRIPT_DIR/force_entry.sh}"
 
+# Optional window state rescan trigger (for dashboard status flip)
+RESCAN_REDIS_KEY="${RESCAN_REDIS_KEY:-system:zombie:rescan_window}"
+RESCAN_SCRIPT="${RESCAN_SCRIPT:-$SCRIPT_DIR/window_scan.sh}"
+
 MODE="loop"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +43,11 @@ fi
 
 if [[ -f "$FORCE_SCRIPT" ]] && [[ ! -x "$FORCE_SCRIPT" ]]; then
   echo "force script not executable: $FORCE_SCRIPT" >&2
+  exit 2
+fi
+
+if [[ -f "$RESCAN_SCRIPT" ]] && [[ ! -x "$RESCAN_SCRIPT" ]]; then
+  echo "rescan script not executable: $RESCAN_SCRIPT" >&2
   exit 2
 fi
 
@@ -141,6 +150,7 @@ run_script_for_key() {
 run_sweep_if_triggered() {
   run_script_for_key "$REDIS_KEY" "$SWEEP_SCRIPT"
   run_script_for_key "$FORCE_REDIS_KEY" "$FORCE_SCRIPT"
+  run_script_for_key "$RESCAN_REDIS_KEY" "$RESCAN_SCRIPT"
 }
 
 case "$MODE" in

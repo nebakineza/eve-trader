@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from oracle.indicators import add_indicators
-
+from oracle.config_loader import GLOBAL_CONFIG
 
 DEFAULT_PARQUET_URL = "http://192.168.14.105:8001/training_data_cleaned.parquet"
 
@@ -39,6 +39,9 @@ FEATURE_NAMES_9D = FEATURE_NAMES_8D + ["warfare_isk_destroyed"]
 # 10D "Macro-Inertia" feature stack: 9D + Demand_Shift
 # Demand_Shift = sum(ISK_Destroyed_60m) / Global_Market_Cap
 FEATURE_NAMES_10D = FEATURE_NAMES_9D + ["demand_shift"]
+
+# 11D "Microstructure" feature stack: 10D + Order Book Imbalance (OBI)
+FEATURE_NAMES_11D = FEATURE_NAMES_10D + ["order_imbalance_ratio"]
 
 
 def _parse_created_at(ts: str | None) -> datetime | None:
@@ -962,19 +965,18 @@ def main():
         default=os.getenv("REDIS_URL", "redis://192.168.14.105:6379/0"),
         help="Redis URL for status + metrics logging (dashboard reads these).",
     )
-    p.add_argument(
-        "--model-dir",
+    p.add_argument("--model-dir",
         default=os.getenv("MODEL_DIR", "models"),
         help="Directory to write versioned models.",
     )
-    p.add_argument("--lookback-minutes", type=int, default=int(os.getenv("LOOKBACK_MINUTES", "360")))
-    p.add_argument("--horizon-minutes", type=int, default=int(os.getenv("HORIZON_MINUTES", "60")))
+    p.add_argument("--lookback-minutes", type=int, default=int(os.getenv("LOOKBACK_MINUTES", "60")))
+    p.add_argument("--horizon-minutes", type=int, default=int(os.getenv("HORIZON_MINUTES", "15")))
     p.add_argument("--bucket-minutes", type=int, default=int(os.getenv("BUCKET_MINUTES", "5")))
     p.add_argument("--max-types", type=int, default=int(os.getenv("MAX_TYPES", "500")))
     p.add_argument("--max-samples", type=int, default=int(os.getenv("MAX_SAMPLES", "200000")))
     p.add_argument("--batch-size", type=int, default=int(os.getenv("BATCH_SIZE", "256")))
     p.add_argument("--epochs", type=int, default=int(os.getenv("EPOCHS", "3")))
-    p.add_argument("--learning-rate", type=float, default=float(os.getenv("LEARNING_RATE", "0.001")))
+    p.add_argument("--learning-rate", type=float, default=float(os.getenv("LEARNING_RATE", "0.005")))
     p.add_argument("--set-live", action="store_true", help="Set oracle:model_status=LIVE after training completes.")
     args = p.parse_args()
 
@@ -1027,3 +1029,76 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def get_weights_ffd(d, thres=1e-5):
+    """
+    Fixed Window Fractional Differentiation weights.
+    d: coefficient (e.g., 0.4)
+    thres: cutoff for weight significance
+    """
+    w, k = [1.], 1
+    while True:
+        w_ = -w[-1] / k * (d - k + 1)
+        if abs(w_) < thres:
+            break
+        w.append(w_)
+        k += 1
+    return np.array(w[::-1]).reshape(-1, 1)
+
+def frac_diff_ffd(series, d, thres=1e-5):
+    """
+    Apply Fixed Window Fractional Differentiation to a pandas Series.
+    """
+    # 1. Compute weights
+    w = get_weights_ffd(d, thres)
+    width = len(w) - 1
+    
+    # 2. Iterate and apply dot product
+    output = []
+    # Using pandas rolling if possible is faster, but this is explicit
+    # For speed on large datasets, we use stride tricks or convolution 
+    # but for typical daily/intraday bars, a loop is acceptable or np.convolve
+    # However, to avoid Lookahead Bias, we convolve properly.
+    
+    # Optimization: Use Fillna to handle NaNs if any
+    series_clean = series.fillna(method='ffill')
+    vals = series_clean.values
+    
+    if len(vals) < width:
+        return pd.Series(np.zeros(len(series)), index=series.index)
+        
+    # Valid convolution
+    # We want valid output starting from index 'width'
+    
+    # fast implementation using numpy scaling
+    res = np.zeros_like(vals)
+    res[:] = np.nan
+    
+    for i in range(width, len(vals)):
+        # Dot product of weights and slice
+        # weights are w[::-1] from the generation, so we match recent to earlier
+        # slice: vals[i-width : i+1] -> size width+1
+        # w size: width+1
+        window = vals[i-width : i+1]
+        res[i] = np.dot(w.T, window)[0]
+        
+    return pd.Series(res, index=series.index)
+
+def apply_stationarity(df, d=0.4):
+    """
+    Applies FracDiff to Price and Volume columns.
+    """
+    # Load d from config if available, else use default arg
+    conf_d = GLOBAL_CONFIG.get("model", {}).get("d_coefficient", d)
+    
+    if 'close' in df.columns:
+        df['frac_close'] = frac_diff_ffd(df['close'], d=conf_d)
+        # Forward fill the initial NaNs created by the window
+        df['frac_close'] = df['frac_close'].fillna(method='bfill')
+        
+    if 'volume' in df.columns:
+        # Volume is often stationary-ish, but FracDiff can help smooth spikes
+        df['frac_volume'] = frac_diff_ffd(df['log_volume'] if 'log_volume' in df.columns else np.log1p(df['volume']), d=conf_d)
+        df['frac_volume'] = df['frac_volume'].fillna(method='bfill')
+        
+    return df

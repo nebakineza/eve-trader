@@ -361,3 +361,27 @@ class ShadowManager:
                 )
 
         return settled
+
+    def cancel_all_active_orders(self) -> int:
+        """
+        Emergency Z-Score Guard: Mark all PENDING trades as CANCELLED.
+        """
+        count = 0
+        try:
+            with self.engine.begin() as conn:
+                res = conn.execute(
+                    text(
+                        """
+                        UPDATE shadow_trades
+                        SET virtual_outcome = 'CANCELLED'
+                        WHERE virtual_outcome = 'PENDING'
+                        """
+                    )
+                )
+                count = res.rowcount
+            if count > 0:
+                logger.warning(f"Z-Score Guard: Cancelled {count} pending shadow trades.")
+        except Exception as e:
+            logger.error(f"Failed to cancel shadow trades: {e}")
+        return count
+

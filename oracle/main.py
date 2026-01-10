@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import torch
+import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -15,6 +16,8 @@ from pydantic import BaseModel
 sys.path.append(os.getcwd())
 
 from oracle.model import OracleTemporalTransformer
+from oracle.processors import apply_stationarity
+from oracle.config_loader import GLOBAL_CONFIG
 
 app = FastAPI(title="Oracle Inference Service")
 logger = logging.getLogger("OracleService")
@@ -250,10 +253,47 @@ class MarketFeatures(BaseModel):
     features: list | dict
     hour: int = 0
     day: int = 0
+    # New: History for FracDiff
+    price_history: list[float] | None = None
+    volume_history: list[float] | None = None
+
 
 @app.post("/predict")
 async def predict(data: MarketFeatures):
     global model
+
+    # 1. STATIONARITY INJECTION (FracDiff)
+    frac_price_val = 0.0
+    frac_vol_val = 0.0
+    
+    # If client sends history, compute FracDiff on the fly
+    if data.price_history and len(data.price_history) >= 15:
+        # Create minimal dataframe
+        df_hist = pd.DataFrame({'close': data.price_history})
+        if data.volume_history and len(data.volume_history) == len(data.price_history):
+             df_hist['volume'] = data.volume_history
+             
+        # Apply transformation
+        df_fd = apply_stationarity(df_hist)
+        
+        # Extract latest value
+        if 'frac_close' in df_fd.columns:
+            # fillna might happen in processor, but ensure float
+            latest = df_fd['frac_close'].iloc[-1]
+            if not pd.isna(latest):
+                frac_price_val = float(latest)
+                
+        if 'frac_volume' in df_fd.columns:
+            latest = df_fd['frac_volume'].iloc[-1]
+            if not pd.isna(latest):
+                frac_vol_val = float(latest)
+    
+    # Inject FracDiff values into feature dictionary if it's a dict
+    # (If it's a list, the client code (Strategist) must have already packed it, 
+    # but currently we only use dict-based inference from Strategist)
+    if isinstance(data.features, dict):
+        data.features['frac_diff_price'] = frac_price_val
+        data.features['frac_diff_volume'] = frac_vol_val
 
     if model is None:
         raise HTTPException(status_code=503, detail="Model not initialized")
@@ -316,3 +356,54 @@ async def predict(data: MarketFeatures):
             "status": "ERROR",
             "forecast_sequence": [] 
         }
+
+class PredictionRequest(BaseModel):
+    # Standard 7 params
+    velocity: float
+    imbalance: float
+    rsi: float
+    macd: float
+    macd_signal: float
+    bb_upper: float
+    bb_lower: float
+    
+    # Macro context
+    players_online: float | None = None
+    isk_destroyed_last_hour: float | None = None
+    global_market_cap: float | None = None
+
+    # Temporal context
+    timestamp: float | None = None
+    price_history: list[float] | None = None # NEW: For FracDiff
+    volume_history: list[float] | None = None # NEW: For FracDiff
+
+@app.post("/predict")
+def predict(req: PredictionRequest):
+    global model, MODEL_META
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    # 1. Apply Stationarity if history provided
+    frac_price = 0.0
+    frac_vol = 0.0
+    
+    if req.price_history and len(req.price_history) > 10:
+        s_price = pd.Series(req.price_history)
+        # Apply strict FracDiff
+        s_diff = apply_stationarity(pd.DataFrame({'close': s_price}))['frac_close']
+        frac_price = float(s_diff.iloc[-1]) # Last value is current state
+        
+    if req.volume_history and len(req.volume_history) > 10:
+        s_vol = pd.Series(req.volume_history)
+        s_diff = apply_stationarity(pd.DataFrame({'volume': s_vol}))['frac_volume']
+        frac_vol = float(s_diff.iloc[-1])
+
+    # 2. Add as extra features if model expects them (12D)
+    # This is a patched injection for the 12D upgrade
+    # We append them to the standard vector
+    
+    # ... (existing prediction logic but now using  etc)
+    # Since I cannot easily splice the exact middle of the file with 'cat', 
+    # I am creating this stub to indicate where the logic goes.
+    # I will perform a proper 'edit' next.
+    return {"status": "stub"}

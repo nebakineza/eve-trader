@@ -16,6 +16,35 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ZombieShot")
 
 
+VISUAL_STATUS_KEY = os.getenv("VISUAL_STATUS_KEY", "system:visual:status")
+VISUAL_STDDEV_KEY = os.getenv("VISUAL_STDDEV_KEY", "system:visual:stream_stddev")
+VISUAL_STREAM_KEY = os.getenv("VISUAL_STREAM_KEY", "system:visual:stream")
+VISUAL_STREAM_OK = os.getenv("VISUAL_STREAM_OK", "STREAM_OK")
+VISUAL_STREAM_OFFLINE = os.getenv("VISUAL_STREAM_OFFLINE", "STREAM_OFFLINE")
+VISUAL_STATUS_DEFAULT = os.getenv("VISUAL_STATUS_DEFAULT", "UNVERIFIED")
+VISUAL_STATUS_OFFLINE = os.getenv("VISUAL_STATUS_OFFLINE", "OFFLINE")
+
+
+def _safe_set_visual_status(redis_url: str, status: str) -> None:
+    """Never override VERIFIED (only OCR Cortex may set it)."""
+    try:
+        cur = redis_get(redis_url, VISUAL_STATUS_KEY)
+        if cur is not None and cur.decode("utf-8", errors="ignore").strip().upper() == "VERIFIED":
+            return
+    except Exception:
+        return
+
+    _safe_redis_set_text(redis_url, VISUAL_STATUS_KEY, status)
+
+
+def _safe_redis_set_text(redis_url: str, key: str, value: str) -> None:
+    try:
+        redis_set(redis_url, key, value.encode("utf-8"))
+    except Exception:
+        # Never let status-key publishing break capture loop
+        pass
+
+
 @dataclass(frozen=True)
 class RedisTarget:
     host: str
@@ -141,49 +170,8 @@ def _wayland_env_for_current_user() -> dict[str, str] | None:
 
 
 def _maximize_game_window(display: str) -> None:
-    """Use xdotool to maximize and focus the main EVE window (skipping Launchers)"""
-    xdotool = shutil.which("xdotool")
-    if not xdotool:
-        logger.warning("xdotool not found; skipping window maximization")
-        return
-
-    env = os.environ.copy()
-    env["DISPLAY"] = display
-
-    try:
-        # 1. Find the window ID of the game client.
-        # Exclude 'EVE Launcher' explicitly. Look for 'EVE' or 'Wine' which usually contain the client.
-        # We search for "EVE" but grep -v Launcher to filter.
-        # `xdotool search --name "EVE"` might return multiple.
-        
-        # Command pipeline: xdotool search --name "EVE" | xargs -I {} xdotool getwindowname {}
-        # We do this in Python for better control.
-        out = subprocess.check_output([xdotool, "search", "--name", "EVE"], env=env, stderr=subprocess.DEVNULL)
-        window_ids = out.decode().strip().split()
-        
-        target_wid = None
-        for wid in window_ids:
-            try:
-                name_bytes = subprocess.check_output([xdotool, "getwindowname", wid], env=env, stderr=subprocess.DEVNULL)
-                name = name_bytes.decode().lower()
-                if "launcher" in name:
-                    continue
-                # Found a candidate that is likely the client
-                target_wid = wid
-                break
-            except subprocess.CalledProcessError:
-                continue
-
-        if target_wid:
-            logger.info("Maximizing Game Window ID: %s", target_wid)
-            subprocess.run([xdotool, "windowactivate", target_wid], env=env, check=False)
-            subprocess.run([xdotool, "windowsize", target_wid, "100%", "100%"], env=env, check=False)
-            subprocess.run([xdotool, "windowfocus", target_wid], env=env, check=False)
-            
-            # Allow WM to settle animation
-            time.sleep(1.0)
-    except Exception as e:
-        logger.warning(f"Failed to maximize EVE window: {e}")
+    """Direct injection/window manipulation has been removed."""
+    return
 
 
 def _capture_x11(*, display: str, png_path: str) -> None:
@@ -230,6 +218,101 @@ def _convert_png_to_jpg(*, png_path: str, jpg_path: str, jpg_quality: int) -> No
     )
 
 
+def _convert_png_sequence_to_gif(*, png_paths: list[str], gif_path: str, frame_delay_ms: int) -> None:
+    convert = _require_tool("convert")
+
+    # ImageMagick -delay is in 1/100th of a second.
+    delay = max(1, int(round(int(frame_delay_ms) / 10.0)))
+
+    subprocess.run(
+        [
+            convert,
+            *png_paths,
+            "-resize",
+            "640x360!",
+            "-loop",
+            "0",
+            "-delay",
+            str(delay),
+            gif_path,
+        ],
+        check=True,
+    )
+
+
+def _png_stddev(png_path: str) -> float | None:
+    """Compute grayscale stddev (0..1) on a tiny downscaled version."""
+    convert = shutil.which("convert")
+    if not convert:
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                convert,
+                png_path,
+                "-colorspace",
+                "Gray",
+                "-resize",
+                "64x64!",
+                "-format",
+                "%[fx:standard_deviation]",
+                "info:",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        txt = out.decode("utf-8", errors="ignore").strip()
+        return float(txt) if txt else None
+    except Exception:
+        return None
+
+
+def _write_offline_png(*, png_path: str, message: str) -> None:
+    convert = _require_tool("convert")
+    # Generate a full-res 1080p frame, then the existing pipeline will downscale to 640x360.
+    subprocess.run(
+        [
+            convert,
+            "-size",
+            "1920x1080",
+            "xc:black",
+            "-gravity",
+            "center",
+            "-fill",
+            "white",
+            "-pointsize",
+            "52",
+            "-annotate",
+            "0",
+            message,
+            png_path,
+        ],
+        check=True,
+    )
+
+
+def _publish_offline(
+    *,
+    out_dir: str,
+    redis_url: str,
+    redis_key: str,
+    jpg_quality: int,
+    message: str = "OFFLINE - AWAITING STREAM",
+) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    png_path = os.path.join(out_dir, "zombie_offline.png")
+    jpg_path = os.path.join(out_dir, "zombie_offline.jpg")
+
+    _write_offline_png(png_path=png_path, message=message)
+    _convert_png_to_jpg(png_path=png_path, jpg_path=jpg_path, jpg_quality=jpg_quality)
+    raw = open(jpg_path, "rb").read()
+    b64 = base64.b64encode(raw)
+    redis_set(redis_url, redis_key, b64)
+    _safe_redis_set_text(redis_url, VISUAL_STREAM_KEY, VISUAL_STREAM_OFFLINE)
+    _safe_set_visual_status(redis_url, VISUAL_STATUS_OFFLINE)
+    _safe_redis_set_text(redis_url, VISUAL_STDDEV_KEY, "0")
+
+
 def capture_once(
     *,
     display: str,
@@ -246,10 +329,13 @@ def capture_once(
     last_err: Exception | None = None
     captured_via = None
 
-    # Strategy: if DISPLAY=:0, try Wayland first (most likely for real client).
-    # If that fails or produces a tiny frame, fall back to X11.
-    # If DISPLAY is not :0, use X11 as primary.
-    prefer_wayland_first = str(display).strip() == ":0"
+    # Strategy:
+    # - Only attempt Wayland capture when a Wayland runtime is present (wayland-* socket).
+    # - Prefer Wayland when available (best signal for a real desktop session), but always
+    #   fall back to X11.
+    wayland_available = _wayland_env_for_current_user() is not None
+    prefer_wayland = os.getenv("ZOMBIE_SHOT_PREFER_WAYLAND", "1").strip().lower() in {"1", "true", "yes"}
+    prefer_wayland_first = wayland_available and (prefer_wayland or str(display).strip() == ":0")
 
     if prefer_wayland_first:
         try:
@@ -279,8 +365,9 @@ def capture_once(
         except Exception as e:
             last_err = e
 
-    # Final fallback: if X11 failed or produced tiny frame, try Wayland once more.
-    if captured_via is None and not prefer_wayland_first:
+    # Final fallback: if X11 failed or produced tiny frame, try Wayland once more
+    # (only if Wayland runtime is actually available).
+    if captured_via is None and not prefer_wayland_first and wayland_available:
         try:
             _capture_wayland(png_path=png_path)
             _convert_png_to_jpg(png_path=png_path, jpg_path=jpg_path, jpg_quality=jpg_quality)
@@ -293,7 +380,8 @@ def capture_once(
             last_err = last_err or e
 
     if captured_via is None:
-        raise RuntimeError(f"No screenshot captured (last error: {last_err})")
+        _publish_offline(out_dir=out_dir, redis_url=redis_url, redis_key=redis_key, jpg_quality=jpg_quality)
+        raise RuntimeError(f"No screenshot captured (published OFFLINE; last error: {last_err})")
 
     if not os.path.exists(jpg_path):
         raise RuntimeError(f"Screenshot file missing after capture (via={captured_via})")
@@ -302,7 +390,30 @@ def capture_once(
         raw = f.read()
 
     if min_jpg_bytes > 0 and len(raw) < int(min_jpg_bytes):
-        raise RuntimeError(f"Screenshot too small ({len(raw)} bytes < {int(min_jpg_bytes)}); likely empty frame")
+        _publish_offline(out_dir=out_dir, redis_url=redis_url, redis_key=redis_key, jpg_quality=jpg_quality)
+        raise RuntimeError(
+            f"Screenshot too small ({len(raw)} bytes < {int(min_jpg_bytes)}); published OFFLINE"
+        )
+
+    # Debug mode: save raw PNG for manual inspection regardless of variance
+    debug_raw = os.getenv("DEBUG_CAPTURE_RAW", "0").strip().lower() in {"1", "true", "yes"}
+    if debug_raw:
+        debug_path = os.path.join(out_dir, "raw_debug.png")
+        try:
+            shutil.copy(png_path, debug_path)
+            logger.info("DEBUG: Saved raw capture to %s", debug_path)
+        except Exception as e:
+            logger.warning("DEBUG: Failed to save raw_debug.png: %s", e)
+
+    stddev = _png_stddev(png_path)
+    if stddev is not None:
+        _safe_redis_set_text(redis_url, VISUAL_STDDEV_KEY, str(stddev))
+        # Allow bypass in debug mode to force stream through
+        if not debug_raw and stddev < float(os.getenv("ZOMBIE_SHOT_STDDEV_MIN", "0.002")):
+            _publish_offline(out_dir=out_dir, redis_url=redis_url, redis_key=redis_key, jpg_quality=jpg_quality)
+            raise RuntimeError(f"Frame variance too low (stddev={stddev}); published OFFLINE")
+        elif debug_raw and stddev < float(os.getenv("ZOMBIE_SHOT_STDDEV_MIN", "0.002")):
+            logger.warning("DEBUG: Variance %.6f < threshold but allowing frame through (DEBUG_CAPTURE_RAW=1)", stddev)
 
     # Proof artifact requested by ops: keep a stable filename for quick verification.
     # Write a higher-quality, full-resolution JPEG so it's easier to confirm we're seeing a real frame.
@@ -316,7 +427,84 @@ def capture_once(
     b64 = base64.b64encode(raw)
     redis_set(redis_url, redis_key, b64)
 
+    _safe_redis_set_text(redis_url, VISUAL_STREAM_KEY, VISUAL_STREAM_OK)
+    _safe_set_visual_status(redis_url, VISUAL_STATUS_DEFAULT)
+
     logger.info("Published screenshot: %d bytes -> %d b64 bytes (via %s)", len(raw), len(b64), captured_via)
+
+
+def capture_gif_once(
+    *,
+    display: str,
+    out_dir: str,
+    redis_url: str,
+    redis_key: str,
+    frames: int,
+    frame_interval_ms: int,
+    min_gif_bytes: int,
+) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Capture a short rolling clip, then publish as a single animated GIF.
+    png_paths: list[str] = []
+    last_err: Exception | None = None
+
+    for i in range(max(1, int(frames))):
+        frame_png = os.path.join(out_dir, f"zombie_live_{i:03d}.png")
+        try:
+            wayland_available = _wayland_env_for_current_user() is not None
+            prefer_wayland = os.getenv("ZOMBIE_SHOT_PREFER_WAYLAND", "1").strip().lower() in {"1", "true", "yes"}
+            prefer_wayland_first = wayland_available and (prefer_wayland or str(display).strip() == ":0")
+
+            if prefer_wayland_first:
+                try:
+                    _capture_wayland(png_path=frame_png)
+                except Exception as e:
+                    last_err = e
+                    _capture_x11(display=display, png_path=frame_png)
+            else:
+                try:
+                    _capture_x11(display=display, png_path=frame_png)
+                except Exception as e:
+                    last_err = e
+                    if wayland_available:
+                        _capture_wayland(png_path=frame_png)
+                    else:
+                        raise
+
+            png_paths.append(frame_png)
+        except Exception as e:
+            last_err = e
+            break
+
+        if i < int(frames) - 1:
+            time.sleep(max(0.0, float(frame_interval_ms) / 1000.0))
+
+    if not png_paths:
+        _publish_offline(out_dir=out_dir, redis_url=redis_url, redis_key=redis_key, jpg_quality=55)
+        raise RuntimeError(f"No screenshot captured for GIF (published OFFLINE; last error: {last_err})")
+
+    # Variance check on first frame (same gate used for JPEG).
+    stddev = _png_stddev(png_paths[0])
+    if stddev is not None:
+        _safe_redis_set_text(redis_url, VISUAL_STDDEV_KEY, str(stddev))
+        if stddev < float(os.getenv("ZOMBIE_SHOT_STDDEV_MIN", "0.002")):
+            _publish_offline(out_dir=out_dir, redis_url=redis_url, redis_key=redis_key, jpg_quality=55)
+            raise RuntimeError(f"Frame variance too low (stddev={stddev}); published OFFLINE")
+
+    gif_path = os.path.join(out_dir, "zombie_live.gif")
+    _convert_png_sequence_to_gif(png_paths=png_paths, gif_path=gif_path, frame_delay_ms=int(frame_interval_ms))
+
+    raw = open(gif_path, "rb").read()
+    if min_gif_bytes > 0 and len(raw) < int(min_gif_bytes):
+        _publish_offline(out_dir=out_dir, redis_url=redis_url, redis_key=redis_key, jpg_quality=55)
+        raise RuntimeError(f"GIF too small ({len(raw)} bytes); published OFFLINE")
+
+    b64 = base64.b64encode(raw)
+    redis_set(redis_url, redis_key, b64)
+    _safe_redis_set_text(redis_url, VISUAL_STREAM_KEY, VISUAL_STREAM_OK)
+    _safe_set_visual_status(redis_url, VISUAL_STATUS_DEFAULT)
+    logger.info("Published screenshot GIF: %d bytes -> %d b64 bytes (%d frames)", len(raw), len(b64), len(png_paths))
 
 
 def main() -> int:
@@ -333,12 +521,25 @@ def main() -> int:
     parser.add_argument("--redis-key", default=os.getenv("ZOMBIE_SHOT_REDIS_KEY", "system:zombie:screenshot"))
     parser.add_argument("--interval-seconds", type=int, default=int(os.getenv("ZOMBIE_SHOT_INTERVAL_SECONDS", "60")))
     parser.add_argument("--loop", action="store_true")
+    parser.add_argument(
+        "--format",
+        default=os.getenv("ZOMBIE_SHOT_FORMAT", "jpg"),
+        choices=["jpg", "gif"],
+        help="Publish format to Redis (jpg or gif).",
+    )
     parser.add_argument("--jpg-quality", type=int, default=int(os.getenv("ZOMBIE_SHOT_JPG_QUALITY", "55")))
+    parser.add_argument("--gif-frames", type=int, default=int(os.getenv("ZOMBIE_SHOT_GIF_FRAMES", "6")))
+    parser.add_argument(
+        "--gif-frame-interval-ms",
+        type=int,
+        default=int(os.getenv("ZOMBIE_SHOT_GIF_FRAME_INTERVAL_MS", "1000")),
+    )
+    parser.add_argument("--min-gif-bytes", type=int, default=int(os.getenv("ZOMBIE_SHOT_MIN_GIF_BYTES", "40960")))
     parser.add_argument(
         "--min-jpg-bytes",
         type=int,
-        default=int(os.getenv("ZOMBIE_SHOT_MIN_JPG_BYTES", "51200")),
-        help="Reject screenshots smaller than this many JPEG bytes (default: 51200).",
+        default=int(os.getenv("ZOMBIE_SHOT_MIN_JPG_BYTES", "5000")),
+        help="Reject screenshots smaller than this many JPEG bytes (default: 5000).",
     )
 
     args = parser.parse_args()
@@ -357,28 +558,17 @@ def main() -> int:
 
 
     if not args.loop:
-        capture_once(
-            display=args.display,
-            out_dir=args.out_dir,
-            redis_url=args.redis_url,
-            redis_key=args.redis_key,
-            jpg_quality=args.jpg_quality,
-            min_jpg_bytes=args.min_jpg_bytes,
-        )
-        return 0
-
-    interval = max(10, int(args.interval_seconds))
-    logger.info("ZombieShot loop started (display=%s interval=%ss)", args.display, interval)
-    while True:
-        # Blind-fire Escape and Return to clear modals (Wine, EVE Launcher)
-        try:
-             subprocess.run(["xdotool", "key", "Escape"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-             time.sleep(0.5)
-             subprocess.run(["xdotool", "key", "Return"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-             pass
-
-        try:
+        if str(args.format).strip().lower() == "gif":
+            capture_gif_once(
+                display=args.display,
+                out_dir=args.out_dir,
+                redis_url=args.redis_url,
+                redis_key=args.redis_key,
+                frames=args.gif_frames,
+                frame_interval_ms=args.gif_frame_interval_ms,
+                min_gif_bytes=args.min_gif_bytes,
+            )
+        else:
             capture_once(
                 display=args.display,
                 out_dir=args.out_dir,
@@ -387,8 +577,37 @@ def main() -> int:
                 jpg_quality=args.jpg_quality,
                 min_jpg_bytes=args.min_jpg_bytes,
             )
+        return 0
+
+    interval = max(10, int(args.interval_seconds))
+    logger.info("ZombieShot loop started (display=%s interval=%ss)", args.display, interval)
+    while True:
+        try:
+            if str(args.format).strip().lower() == "gif":
+                capture_gif_once(
+                    display=args.display,
+                    out_dir=args.out_dir,
+                    redis_url=args.redis_url,
+                    redis_key=args.redis_key,
+                    frames=args.gif_frames,
+                    frame_interval_ms=args.gif_frame_interval_ms,
+                    min_gif_bytes=args.min_gif_bytes,
+                )
+            else:
+                capture_once(
+                    display=args.display,
+                    out_dir=args.out_dir,
+                    redis_url=args.redis_url,
+                    redis_key=args.redis_key,
+                    jpg_quality=args.jpg_quality,
+                    min_jpg_bytes=args.min_jpg_bytes,
+                )
         except Exception as e:
             logger.error("Capture failed: %s", e)
+            try:
+                _publish_offline(out_dir=args.out_dir, redis_url=args.redis_url, redis_key=args.redis_key, jpg_quality=args.jpg_quality)
+            except Exception:
+                pass
         time.sleep(interval)
 
 

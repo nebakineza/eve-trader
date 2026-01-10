@@ -4,7 +4,7 @@ set -e
 # Configuration
 REMOTE_USER="seb"
 REMOTE_HOST="192.168.14.105"
-REMOTE_DIR="/home/seb/nebakineza/eve-trader"
+REMOTE_DIR="/home/${REMOTE_USER}/eve-trader"
 
 echo "==================================================="
 echo "   🚀 Pushing Code from Brain (SKYNET) to Body ($REMOTE_HOST)"
@@ -15,14 +15,17 @@ echo "📂 Ensuring remote directory exists..."
 ssh -o StrictHostKeyChecking=no $REMOTE_USER@$REMOTE_HOST "mkdir -p $REMOTE_DIR"
 
 # 2. Sync Files (Excluding heavy data/git)
-echo "cwRsyching files..."
-rsync -avz -e "ssh -o StrictHostKeyChecking=no" \
+echo "Syncing files..."
+rsync -avz --delete -e "ssh -o StrictHostKeyChecking=no" \
     --exclude '.git' \
     --exclude 'data' \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude 'venv' \
+    --exclude '.venv' \
+    --exclude '.venv-blackwell' \
     --exclude '*.deb' \
+    --exclude 'pgdata' \
     ./ $REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/
 
 # 3. Execute Deployment on Remote

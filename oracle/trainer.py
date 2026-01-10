@@ -55,9 +55,11 @@ class OracleTrainer:
     def train_epoch(self, dataloader: DataLoader):
         self.model.train()
         total_loss = 0
+        device = next(self.model.parameters()).device
         
         for batch in dataloader:
             x, hours, days, y_target = batch
+            x, hours, days, y_target = x.to(device), hours.to(device), days.to(device), y_target.to(device)
             
             self.optimizer.zero_grad()
             

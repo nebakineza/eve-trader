@@ -1,0 +1,49 @@
+{
+    "manifest_version": "1.0",
+    "resolution": "1920x1080",
+    "windows": {
+        "market": {
+            "anchor": "center-right",
+            "x": 1200,
+            "y": 400,
+            "width": 600,
+            "height": 800,
+            "actions": {
+                "buy": {"x": 1250, "y": 850},
+                "sell": {"x": 1350, "y": 850},
+                "refresh": {"x": 1750, "y": 420},
+                "export": {"x": 1400, "y": 900}
+            }
+        },
+        "inventory": {
+            "anchor": "bottom-left",
+            "x": 20,
+            "y": 600,
+            "width": 400,
+            "height": 400,
+            "actions": {
+                "list_view": {"x": 50, "y": 640},
+                "filter": {"x": 150, "y": 640}
+            }
+        },
+        "wallet": {
+            "anchor": "top-left",
+            "x": 20,
+            "y": 100,
+            "width": 400,
+            "height": 300,
+            "actions": {
+                "transactions": {"x": 50, "y": 140},
+                "journal": {"x": 120, "y": 140}
+            }
+        },
+        "station_services": {
+            "anchor": "right-dock",
+            "x": 1700,
+            "y": 100,
+            "actions": {
+                "undock": {"x": 1800, "y": 150}
+            }
+        }
+    }
+}

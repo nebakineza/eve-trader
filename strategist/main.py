@@ -3,6 +3,8 @@ import logging
 import os
 import sys
 import json
+import math
+import numpy as np
 import aiohttp
 import sqlalchemy
 from sqlalchemy import text
@@ -17,9 +19,15 @@ from strategist.logic import update_market_radar
 from scripts.notifier import send_alert
 from strategist.shadow_manager import ShadowManager
 from strategist.shadow_manager import ShadowConfig
+from oracle.config_loader import GLOBAL_CONFIG
 
 
 def _read_shadow_threshold(*, bridge: DataBridge, fallback: float) -> float:
+    # 0. Priority: Config.json
+    config_val = GLOBAL_CONFIG.get("risk", {}).get("confidence_threshold")
+    if config_val is not None:
+        return float(config_val)
+
     # Primary key per spec
     keys = [
         "system:shadow:confidence_threshold",
@@ -86,6 +94,7 @@ async def main():
     logger.info("Strategist Main Loop Started (Rate: 5 mins)")
 
     oracle_is_up = False
+    z_score_breach_start = None
 
     while True:
         try:
@@ -113,12 +122,44 @@ async def main():
                 try:
                     # Traffic Guardrails: widen stop-loss during high-volatility warfare.
                     warfare_isk = 0.0
+                    z_score = 0.0
                     try:
                         v = bridge.redis_client.get("system:macro:warfare")
                         if v is not None:
                             warfare_isk = float(v)
+                        
+                        z = bridge.redis_client.get("system:market:volatility_z_score")
+                        if z is not None:
+                            z_score = float(z)
                     except Exception:
                         warfare_isk = 0.0
+                        z_score = 0.0
+                    
+                    # Z-Score Volatility Guard (Panic-Sell Prevention)
+                    if z_score > 1.96:
+                        # Start timer if not running
+                        if z_score_breach_start is None:
+                            z_score_breach_start = time.time()
+                            logger.warning(f"⚠️ Z-Score Breach Potential (Z={z_score:.2f}). Timer started.")
+                        
+                        # Check duration
+                        elapsed = time.time() - z_score_breach_start
+                        grace_period = 10.0 # User requested 10s grace
+                        
+                        if elapsed > grace_period:
+                            logger.warning(f"⚠️ Z-Score Guard Triggered (Z={z_score:.2f} > 1.96 for {elapsed:.1f}s). Cancelling all active orders.")
+                            shadow.cancel_all_active_orders()
+                            time.sleep(60) # Pause
+                            z_score_breach_start = None # Reset after action
+                            continue
+                        else:
+                             # Just waiting
+                             pass
+                    else:
+                        # Reset if dips back below
+                        if z_score_breach_start is not None:
+                             logger.info("Z-Score normalized; breach timer reset.")
+                             z_score_breach_start = None
 
                     warfare_threshold = float(os.getenv("SHADOW_WARFARE_THRESHOLD_ISK", "0"))
                     war_stop_loss_pct = float(os.getenv("SHADOW_WAR_STOP_LOSS_PCT", "0.03"))
@@ -190,27 +231,60 @@ async def main():
                 if features_raw:
                     features = json.loads(features_raw) if isinstance(features_raw, str) else features_raw
                 
-                # 2. Enrich with History (Resilience Fix)
-                # If Redis is empty or just to add trend data, we pull the last history row.
+                # 2. Enrich with History & Stats (FracDiff + Z-Score)
+                price_hist = []
+                vol_hist = []
+                z_score = 0.0
+                volatility_price = 0.0
+
                 if db_engine:
                     try:
                         with db_engine.connect() as conn:
+                            # Fetch last 15 days for FracDiff + Volatility analysis
                             query = text("""
-                                SELECT close, volume, high, low 
+                                SELECT close, volume 
                                 FROM market_history 
                                 WHERE type_id = :tid 
                                 ORDER BY timestamp DESC 
-                                LIMIT 1
+                                LIMIT 15
                             """)
-                            result = conn.execute(query, {"tid": type_id}).fetchone()
-                            if result:
-                                features['last_close'] = result[0]
-                                features['last_volume'] = result[1]
+                            rows = conn.execute(query, {"tid": type_id}).fetchall()
+                            
+                            if rows:
+                                # Reverse to chronological order (Oldest -> Newest)
+                                chrono_rows = rows[::-1]
+                                price_hist = [float(r[0]) for r in chrono_rows]
+                                vol_hist = [float(r[1]) for r in chrono_rows]
+                                
+                                # Inject into features for Oracle
+                                features['price_history'] = price_hist
+                                features['volume_history'] = vol_hist
+                                features['last_close'] = price_hist[-1]
+                                features['last_volume'] = vol_hist[-1]
+                                
                                 # Fallback if live price is missing
                                 if 'price' not in features:
-                                    features['price'] = result[0]
+                                    features['price'] = price_hist[-1]
+
+                                # Calculate Z-Score & Volatility
+                                if len(price_hist) > 5:
+                                    prices_arr = np.array(price_hist)
+                                    mean_price = np.mean(prices_arr)
+                                    std_price = np.std(prices_arr)
+                                    current_p = features.get('price', prices_arr[-1])
+                                    
+                                    if std_price > 0:
+                                        # Z-Score of current price relative to recent history
+                                        z_score = (current_p - mean_price) / std_price
+                                        volatility_price = std_price # StdDev of price levels
                     except Exception as e:
                         logger.warning(f"History fetch failed for {type_id}: {e}")
+
+                # Dynamic Z-Score Halt
+                # Stop processing if volatility is currently extreme (> 1.96 sigma deviation)
+                if abs(z_score) > 1.96:
+                    logger.info(f"🛑 HALT: Z-Score violation for {type_id} (Z={z_score:.2f}) - Skipping")
+                    continue
 
                 # If we still don't have a price, derive a basic quote from the current order book snapshot.
                 if db_engine and (not features or 'price' not in features):
@@ -345,6 +419,36 @@ async def main():
                 signal_strength = confidence
                 status = "WATCH"
 
+                # --- KELLY CRITERION SIZING ENGINE ---
+                # Formula: f* = (p * b - q) / b with 0.25 multiplier
+                kelly_fraction = 0.0
+                
+                # Directive B: Probability Calibration (Shrinkage)
+                # Default to 0.9 shrinkage factor as safety margin against optimism bias
+                p_calibrated = confidence * 0.9
+                p_win = p_calibrated
+                q_loss = 1.0 - p_win
+                
+                # Directive C preview: Metric calc
+                # Win = Predicted Upside
+                # Loss = 2 * Volatility (approx 95% confidence interval of downside)
+                risk_metric = 2.0 * volatility_price if volatility_price > 0 else current_price * 0.05
+                potential_win = predicted_price - current_price
+                
+                # Directive C: Automated Stop-Loss Injection
+                # Stop Loss = Entry_Price - (2 * Rolling_Volatility)
+                stop_loss_price = current_price - risk_metric
+                
+                if risk_metric > 0 and potential_win > 0:
+                     b_odds = potential_win / risk_metric
+                     if b_odds > 0:
+                        f_star = (p_win * b_odds - q_loss) / b_odds
+                        kelly_fraction = max(0.0, f_star * 0.25)
+
+                # Directive B: Hard Cap
+                # Limit to 5% of total bankroll per trade
+                kelly_fraction = min(kelly_fraction, 0.05)
+
                 # --- CACHE REFRESH FIX ---
                 # Explicitly update status in Redis to avoid stale keys
                 status_key = f"market_radar:{type_id}"
@@ -354,13 +458,15 @@ async def main():
                     "timestamp": datetime.utcnow().isoformat(),
                     "price": current_price,
                     "predicted": predicted_price,
-                    "confidence": confidence
+                    "confidence": confidence,
+                    "kelly_fraction": kelly_fraction,
+                    "stop_loss_price": stop_loss_price
                 }), ex=300) # 5 min expiry matches loop
 
                 # STRONG BUY Condition
                 if confidence > 0.6 and predicted_profit > 50_000_000:
                     status = "ENTER"
-                    logger.info(f"🚀 STRONG BUY SIGNAL: {type_id} | Conf: {confidence:.2f}")
+                    logger.info(f"🚀 STRONG BUY SIGNAL: {type_id} | Conf: {confidence:.2f} | Kelly: {kelly_fraction:.4f}")
 
                     # Send Alert
                     # Item Name map (Mock)

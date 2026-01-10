@@ -1,5 +1,5 @@
 [Unit]
-Description=EVE Trader ZombieShot (publish DISPLAY=:1 screenshot to Redis)
+Description=EVE Trader ZombieShot (publish DISPLAY capture to Redis)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,6 +7,16 @@ Wants=network-online.target
 Type=oneshot
 User=seb
 WorkingDirectory=/home/seb/eve-trader
-Environment=DISPLAY=:1
-ExecStart=/usr/bin/python3 /home/seb/eve-trader/scripts/zombie_shot.py --redis-url redis://127.0.0.1:6379/0
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=REDIS_URL=redis://127.0.0.1:6379/0
+Environment=ZOMBIE_SHOT_REDIS_KEY=system:zombie:screenshot
+Environment=ZOMBIE_SHOT_OUT_DIR=/tmp/eve-trader
+Environment=ZOMBIE_SHOT_FORMAT=gif
+Environment=ZOMBIE_SHOT_GIF_FRAMES=5
+Environment=ZOMBIE_SHOT_GIF_FRAME_INTERVAL_MS=800
+Environment=ZOMBIE_SHOT_MIN_GIF_BYTES=40960
+ExecStart=/usr/bin/python3 /home/seb/eve-trader/scripts/zombie_shot.py --display :0 --redis-url redis://127.0.0.1:6379/0 --redis-key system:zombie:screenshot --out-dir /tmp/eve-trader --format gif --gif-frames 5 --gif-frame-interval-ms 800 --min-gif-bytes 40960
+StandardOutput=journal
+StandardError=journal
 

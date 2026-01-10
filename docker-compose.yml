@@ -51,7 +51,7 @@ services:
       - db
       - cache
     environment:
-      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - DATABASE_URL=postgresql://eve_user:eve_pass@eve-trader-db:5432/eve_market_data
       - REDIS_URL=redis://cache:6379/0
       - KONGYO2_OSINT_MCP_ENDPOINT=${KONGYO2_OSINT_MCP_ENDPOINT:-}
       - WAR_ZKILL_ESI_TIME_LOOKUP=1
@@ -71,15 +71,16 @@ services:
     build: .
     container_name: eve-trader-nexus-dashboard
     mem_limit: 512m
-    command: streamlit run nexus/command_center.py --server.port 8501 --server.address 0.0.0.0
+    command: streamlit run nexus/command_center.py --server.port 8501 --server.address 0.0.0.0 --server.fileWatcherType none
     ports:
       - "8501:8501"
     depends_on:
       - db
       - cache
     environment:
-      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - DATABASE_URL=postgresql://eve_user:eve_pass@eve-trader-db:5432/eve_market_data
       - REDIS_URL=redis://cache:6379/0
+      - ORACLE_HOST=http://192.168.10.108:8000
     volumes:
       - ./:/app
     networks:
@@ -99,7 +100,7 @@ services:
       - db
       - cache
     environment:
-      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - DATABASE_URL=postgresql://eve_user:eve_pass@eve-trader-db:5432/eve_market_data
       - REDIS_URL=redis://cache:6379/0
       - SYSTEM_MODE=SHADOW
       - ORACLE_HOST=${ORACLE_HOST:-http://192.168.10.108:8000}
@@ -149,7 +150,7 @@ services:
       - /dev/ttyACM0:/dev/ttyACM0
     environment:
       - REDIS_URL=redis://cache:6379/0
-      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - DATABASE_URL=postgresql://eve_user:eve_pass@eve-trader-db:5432/eve_market_data
       - ARDUINO_PORT=/dev/ttyACM0
       - ARDUINO_BAUD=9600
       - ARDUINO_DRY_RUN=0
@@ -177,7 +178,7 @@ services:
       - db
       - cache
     environment:
-      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - DATABASE_URL=postgresql://eve_user:eve_pass@eve-trader-db:5432/eve_market_data
       - REDIS_URL=redis://cache:6379/0
     volumes:
       - ./:/app
@@ -197,7 +198,7 @@ services:
     ports:
       - "8001:8001"
     environment:
-      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - DATABASE_URL=postgresql://eve_user:eve_pass@eve-trader-db:5432/eve_market_data
     volumes:
       - ./:/app
     networks:
@@ -217,7 +218,7 @@ services:
     depends_on:
       - db
     environment:
-      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - DATABASE_URL=postgresql://eve_user:eve_pass@eve-trader-db:5432/eve_market_data
       - REDIS_URL=redis://cache:6379/0
     volumes:
       - ./:/app
@@ -238,7 +239,7 @@ services:
     depends_on:
       - db
     environment:
-      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - DATABASE_URL=postgresql://eve_user:eve_pass@eve-trader-db:5432/eve_market_data
     volumes:
       - ./:/app
     networks:
@@ -283,7 +284,7 @@ services:
       - db
       - cache
     environment:
-      - DATABASE_URL=postgresql://eve_user:eve_pass@db:5432/eve_market_data
+      - DATABASE_URL=postgresql://eve_user:eve_pass@eve-trader-db:5432/eve_market_data
       - REDIS_URL=redis://cache:6379/0
       - DAILY_ALPHA_REDIS_KEY=performance:last24h
       - DAILY_ALPHA_HORIZON_MINUTES=60
@@ -308,12 +309,13 @@ services:
     environment:
       - REDIS_URL=redis://cache:6379/0
       - GPU_LOGGER_INTERVAL_SECONDS=30
+      - GPU_METRIC_PREFIX=system:skynet
     volumes:
       - ./:/app
     networks:
       - eve_net
     restart: unless-stopped
-    gpus: all
+    # gpus: all
     logging:
       driver: "json-file"
       options:

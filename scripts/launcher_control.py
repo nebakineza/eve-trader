@@ -1,189 +1,171 @@
 #!/usr/bin/env python3
-"""launcher_control.py
+"""launcher_control.py - Neural Interface Edition
 
-Automation helper for the EVE Launcher running under Wine on a headless X display.
-
-Goal: keep nudging the launcher "Play" action until the client is actually running.
-
-Design notes:
-- The launcher UI is often custom; pixel-perfect detection is unreliable.
-- We default to a safe heuristic: focus launcher window, then either:
-  - press Return (many launchers map default button to Enter)
-  - or click near the center-bottom of the window (common "Play" placement)
-
-This script is intentionally conservative: it only triggers when the client is NOT
-running, and the launcher window IS present.
-
-Environment:
-- DISPLAY: X display to target (e.g. :1)
-
-Examples:
-  DISPLAY=:1 python3 scripts/launcher_control.py --loop
-  DISPLAY=:1 python3 scripts/launcher_control.py --click --click-x 0.5 --click-y 0.92 --loop
+Utilizes the iGPU-accelerated Visual Cortex to intelligently manage
+the EVE Launcher states (Play, Update, Verify).
 """
 
-from __future__ import annotations
-
 import argparse
+import sys
 import os
-import shlex
-import subprocess
 import time
-from dataclasses import dataclass
+import subprocess
+import logging
 
+# Path Hygiene: Add project root to path to reach nexus
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+sys.path.append(project_root)
 
-@dataclass(frozen=True)
-class ClickSpec:
-    # Relative coordinates in the window (0..1)
-    rel_x: float
-    rel_y: float
+try:
+    from nexus.automaton.visual_cortex import VisualCortex
+except ImportError:
+    print("FATAL: Could not import VisualCortex. Check project structure.")
+    sys.exit(1)
 
+try:
+    from scripts.arduino_connector import ArduinoBridge
+except ImportError:
+    try:
+        from arduino_connector import ArduinoBridge
+    except ImportError:
+        ArduinoBridge = None
 
-def _run(cmd: list[str], *, env: dict[str, str] | None = None, check: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [launcher_control] - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-
-def _which(name: str) -> str:
-    p = _run(["bash", "-lc", f"command -v {shlex.quote(name)}"]).stdout.strip()
-    if not p:
-        raise FileNotFoundError(f"Required tool not found: {name}")
-    return p
-
-
-def _pgrep_any(patterns: list[str]) -> bool:
-    # Use pgrep -af so we can match Windows exe strings embedded in Wine.
-    for pat in patterns:
-        cp = _run(["pgrep", "-af", pat])
-        if cp.returncode == 0 and cp.stdout.strip():
-            return True
-    return False
-
-
-def _find_window_ids(name_patterns: list[str]) -> list[str]:
-    ids: list[str] = []
-    for pat in name_patterns:
-        cp = _run(["xdotool", "search", "--name", pat])
-        if cp.returncode == 0:
-            for line in cp.stdout.splitlines():
-                line = line.strip()
-                if line and line.isdigit():
-                    ids.append(line)
-    # De-dupe while preserving order
-    seen = set()
-    out: list[str] = []
-    for wid in ids:
-        if wid not in seen:
-            seen.add(wid)
-            out.append(wid)
-    return out
-
-
-def _window_geometry(window_id: str) -> tuple[int, int, int, int] | None:
-    # Returns (x, y, width, height)
-    cp = _run(["xdotool", "getwindowgeometry", "--shell", window_id])
-    if cp.returncode != 0:
-        return None
-    vals: dict[str, int] = {}
-    for line in cp.stdout.splitlines():
-        if "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        if k in {"X", "Y", "WIDTH", "HEIGHT"}:
+class HardwareController:
+    def __init__(self):
+        self.bridge = None
+        if ArduinoBridge:
             try:
-                vals[k] = int(v)
-            except ValueError:
+                baud_rate = int(os.getenv("ARDUINO_BAUD", "9600"))
+                port = os.getenv("ARDUINO_PORT")
+                self.bridge = ArduinoBridge(baud_rate=baud_rate, port=port)
+                if not self.bridge.is_active():
+                    self.bridge = None
+            except Exception:
                 pass
-    if all(k in vals for k in ("X", "Y", "WIDTH", "HEIGHT")):
-        return vals["X"], vals["Y"], vals["WIDTH"], vals["HEIGHT"]
-    return None
+        
+        if self.bridge:
+            logger.info("Hardware Bridge ACTIVE (/dev/ttyACM0).")
+        else:
+            logger.critical("Hardware Bridge DISCONNECTED. TERMINATING TO PREVENT BAN.")
+            sys.exit("CRITICAL: HARDWARE DISCONNECTED. TERMINATING TO PREVENT BAN.")
 
+    def click(self, x, y):
+        if self.bridge:
+            # Protocol: MOV:x,y then CLK
+            self.bridge.send_command(f"MOV:{x},{y}")
+            # Debounce
+            time.sleep(0.1)
+            self.bridge.send_command("CLK")
+            logger.info(f"HARDWARE CLICK at {x},{y}")
+        else:
+            sys.exit("CRITICAL: HARDWARE DISCONNECTED.")
 
-def _activate(window_id: str) -> None:
-    _run(["xdotool", "windowactivate", "--sync", window_id])
+    def hotkey(self, cmd: str) -> bool:
+        """Send a keyboard macro via GhostHID/Arduino (hardware-only)."""
+        if not self.bridge:
+            sys.exit("CRITICAL: HARDWARE DISCONNECTED.")
+        try:
+            ok = bool(self.bridge.send_command(cmd))
+            if ok:
+                logger.info(f"HARDWARE HOTKEY: {cmd}")
+            else:
+                logger.warning(f"HARDWARE HOTKEY FAILED: {cmd}")
+            return ok
+        except Exception as e:
+            logger.warning(f"HARDWARE HOTKEY ERROR: {cmd} ({e})")
+            return False
 
+    def potato_mode(self) -> None:
+        """Apply potato-mode toggles via GhostHID (no software injection)."""
+        # NOTE: Command names must match the Arduino firmware mappings.
+        # Known supported in hardware/stealth_hid.ino: CTRL+SHIFT+F9
+        logger.info("POTATO MODE: sending CTRL+SHIFT+F9")
+        self.hotkey("CTRL+SHIFT+F9")
+        time.sleep(0.5)
+        # Optional: some firmwares support ALT+C for inventory; best-effort.
+        logger.info("POTATO MODE: sending ALT+C")
+        self.hotkey("ALT+C")
 
-def _press_return(window_id: str) -> None:
-    _activate(window_id)
-    _run(["xdotool", "key", "--clearmodifiers", "Return"])
+def is_client_running():
+    # Safer check for exefile.exe or eve-online.exe
+    # Returns 0 (True) if found, 1 (False) if not
+    try:
+        # pgrep -f matches the full command line
+        # We assume if 'exefile.exe' or 'eve-online.exe' is running, the client is up.
+        # We suppress output.
+        ret = subprocess.call(["pgrep", "-f", "exefile.exe|eve-online.exe"], stdout=subprocess.DEVNULL)
+        return ret == 0
+    except Exception:
+        return False
 
-
-def _click(window_id: str, click: ClickSpec) -> None:
-    geo = _window_geometry(window_id)
-    if not geo:
-        return
-    _, _, w, h = geo
-    x = max(0, min(w - 1, int(w * click.rel_x)))
-    y = max(0, min(h - 1, int(h * click.rel_y)))
-    _activate(window_id)
-    _run(["xdotool", "mousemove", "--window", window_id, str(x), str(y)])
-    _run(["xdotool", "click", "1"])
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Automate EVE Launcher Play trigger via xdotool")
-    parser.add_argument("--loop", action="store_true", help="Run forever")
-    parser.add_argument("--interval-seconds", type=int, default=60)
-
-    parser.add_argument(
-        "--launcher-window-pattern",
-        action="append",
-        default=["EVE Launcher"],
-        help="Regex-like pattern passed to xdotool --name (can be repeated)",
-    )
-
-    parser.add_argument(
-        "--client-proc-pattern",
-        action="append",
-        default=["exefile.exe", "eve-online.exe"],
-        help="Process substring/regex for pgrep -af indicating client is running (can be repeated)",
-    )
-
-    parser.add_argument("--press-return", action="store_true", default=True)
-    parser.add_argument("--no-press-return", dest="press_return", action="store_false")
-
-    parser.add_argument("--click", action="store_true", help="Also click window at relative coords")
-    parser.add_argument("--click-x", type=float, default=0.50)
-    parser.add_argument("--click-y", type=float, default=0.92)
-
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--loop", action="store_true")
+    # Tighter interval for responsiveness
+    parser.add_argument("--interval", type=int, default=5)
     args = parser.parse_args()
+    
+    controller = HardwareController()
+    
+    logger.info("Initializing Visual Cortex (iGPU)...")
+    vc = VisualCortex(display=":0")
+    
+    client_was_running = False
 
-    _which("xdotool")
-    _which("pgrep")
-
-    interval = max(5, int(args.interval_seconds))
-    click_spec = ClickSpec(rel_x=float(args.click_x), rel_y=float(args.click_y))
-
-    def tick() -> None:
-        if _pgrep_any(list(args.client_proc_pattern)):
-            print("[launcher_control] client appears running; no action")
-            return
-
-        wids = _find_window_ids(list(args.launcher_window_pattern))
-        if not wids:
-            print("[launcher_control] launcher window not found; no action")
-            return
-
-        wid = wids[0]
-        print(f"[launcher_control] client not running; nudging launcher wid={wid}")
-        if args.press_return:
-            _press_return(wid)
-        if args.click:
-            _click(wid, click_spec)
-
-    if not args.loop:
-        tick()
-        return 0
-
-    print(f"[launcher_control] loop started (interval={interval}s display={os.getenv('DISPLAY','')})")
     while True:
         try:
-            tick()
-        except Exception as e:
-            print(f"[launcher_control] error: {e}")
-        time.sleep(interval)
+            # 1. Check client status
+            if is_client_running():
+                if not client_was_running:
+                    logger.info("Client Launch Detected! Triggering Potato Mode...")
+                    # Delay slightly to ensure window mapping
+                    time.sleep(5)
+                    # Potato Mode via GhostHID (hardware-only)
+                    controller.potato_mode()
+                    client_was_running = True
+                
+                logger.info("Game Client Active. Standing by.")
+                if not args.loop: break
+                time.sleep(args.interval)
+                continue
+            
+            # Client is not running, so we must be in launcher context
+            client_was_running = False 
+            
+            # 2. Analyze Launcher State
+            state, coords = vc.analyze_state()
+            
+            if state == vc.STATE_PLAY_READY and coords:
+                cx, cy = coords
+                logger.info(f"STATE: PLAY_READY. Engaging at ({cx}, {cy})...")
+                controller.click(cx, cy)
+                # Wait for response before looping immediately
+                time.sleep(15) 
+                
+            elif state == vc.STATE_UPDATE_REQUIRED:
+                # We are purging yellow hallucinations, so we ignore this or log only
+                logger.warning("STATE: UPDATE_REQUIRED detected but update-click is DISABLED (Purge Hallucination Mode).")
+                
+            elif state == vc.STATE_VERIFYING:
+                logger.info("STATE: VERIFYING. Waiting for completion...")
+                
+            else:
+                logger.debug("STATE: UNKNOWN/IDLE. Scanning...")
 
+        except KeyboardInterrupt:
+            logger.info("Manual Interrupt.")
+            break
+        except Exception as e:
+            logger.error(f"Loop error: {e}")
+            time.sleep(5)
+        
+        if not args.loop:
+            break
+        time.sleep(args.interval)
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

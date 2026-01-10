@@ -33,7 +33,28 @@ textureQuality: 0
 shaderQuality: 0
 shadowQuality: 0
 antiAliasing: 0
+# Potato Mode Additions
+uiScale: 1.0
+fpsLimit: 30
+autoTracking: 0
+overviewTransparency: 0
+windowTransparency: 0
+windowBlur: 0
 """
+
+
+def _send_blind_keypress(keys: str, display: str = ":0") -> None:
+    """Direct injection has been removed (xdotool disabled)."""
+    raise RuntimeError("Direct injection is disabled")
+
+
+def _apply_runtime_optimizations() -> None:
+    """
+    Waits for the client window to be visible, then injects runtime toggles.
+    Triggered after config injection.
+    """
+    print("[potatofy] Runtime optimizations disabled (direct injection removed).")
+    return
 
 
 def _iter_candidate_paths(root: Path) -> list[Path]:

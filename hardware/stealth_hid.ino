@@ -28,9 +28,14 @@ void loop() {
 
 void processCommand(String cmd) {
   // Protocol: "KEY:c" or "MOD:ctrl+c"
+
+  // Handshake / health-check
+  if (cmd == "PING") {
+    Serial.println("PONG");
+  }
   
   // Simple single key press
-  if (cmd.startsWith("PRESS:")) {
+  else if (cmd.startsWith("PRESS:")) {
     char key = cmd.substring(6)[0];
     Keyboard.press(key);
     delay(random(80, 150)); // Hardware Jitter
@@ -56,6 +61,14 @@ void processCommand(String cmd) {
     Keyboard.press('m');
     delay(random(80, 150));
     Keyboard.release('m');
+    Keyboard.release(KEY_LEFT_ALT);
+  }
+  else if (cmd == "ALT+C") {
+    Keyboard.press(KEY_LEFT_ALT);
+    delay(random(20, 50));
+    Keyboard.press('c');
+    delay(random(80, 150));
+    Keyboard.release('c');
     Keyboard.release(KEY_LEFT_ALT);
   }
   else if (cmd == "SHIFT+S") {

@@ -44,6 +44,8 @@ def _ensure_market_history_schema(conn) -> None:
                 max_velocity DOUBLE PRECISION,
                 median_spread DOUBLE PRECISION,
                 order_book_imbalance DOUBLE PRECISION,
+                players_online INT,
+                warfare_isk_destroyed DOUBLE PRECISION,
                 PRIMARY KEY (timestamp, region_id, type_id)
             );
             """
@@ -54,6 +56,44 @@ def _ensure_market_history_schema(conn) -> None:
         cur.execute("ALTER TABLE market_history ADD COLUMN IF NOT EXISTS max_velocity DOUBLE PRECISION;")
         cur.execute("ALTER TABLE market_history ADD COLUMN IF NOT EXISTS median_spread DOUBLE PRECISION;")
         cur.execute("ALTER TABLE market_history ADD COLUMN IF NOT EXISTS order_book_imbalance DOUBLE PRECISION;")
+        cur.execute("ALTER TABLE market_history ADD COLUMN IF NOT EXISTS players_online INT;")
+        cur.execute("ALTER TABLE market_history ADD COLUMN IF NOT EXISTS warfare_isk_destroyed DOUBLE PRECISION;")
+
+
+def _read_players_online(redis_url: str | None) -> int | None:
+    if not redis_url:
+        return None
+    try:
+        import redis
+
+        r = redis.Redis.from_url(redis_url, decode_responses=True)
+        v = r.get("system:macro:players")
+        if v is None:
+            return None
+        players = int(float(v))
+        if players < 0:
+            return None
+        return players
+    except Exception:
+        return None
+
+
+def _read_warfare_isk_destroyed(redis_url: str | None) -> float | None:
+    if not redis_url:
+        return None
+    try:
+        import redis
+
+        r = redis.Redis.from_url(redis_url, decode_responses=True)
+        v = r.get("system:macro:warfare")
+        if v is None:
+            return None
+        isk = float(v)
+        if isk < 0:
+            return None
+        return isk
+    except Exception:
+        return None
 
 
 def _fetch_snapshot_features(engine, window_start: datetime, window_end: datetime) -> pd.DataFrame:
@@ -79,7 +119,13 @@ def _fetch_snapshot_features(engine, window_start: datetime, window_end: datetim
     return pd.read_sql_query(query, engine, params=(start_naive, end_naive))
 
 
-def _compute_bucket_rows(df_orders: pd.DataFrame, bucket_timestamp: datetime) -> list[tuple]:
+def _compute_bucket_rows(
+    df_orders: pd.DataFrame,
+    bucket_timestamp: datetime,
+    *,
+    players_online: int | None,
+    warfare_isk_destroyed: float | None,
+) -> list[tuple]:
     if df_orders.empty:
         return []
 
@@ -180,6 +226,8 @@ def _compute_bucket_rows(df_orders: pd.DataFrame, bucket_timestamp: datetime) ->
                 max_velocity,
                 median_spread,
                 order_book_imbalance,
+                (int(players_online) if players_online is not None else None),
+                (float(warfare_isk_destroyed) if warfare_isk_destroyed is not None else None),
             )
         )
 
@@ -189,6 +237,7 @@ def _compute_bucket_rows(df_orders: pd.DataFrame, bucket_timestamp: datetime) ->
 def write_market_history_tick(
     *,
     database_url: str,
+    redis_url: str | None,
     region_id: int | None,
     bucket_minutes: int,
     lookback_minutes: int,
@@ -206,7 +255,14 @@ def write_market_history_tick(
         if region_id is not None and not df_orders.empty:
             df_orders = df_orders[df_orders["region_id"] == region_id]
 
-        rows = _compute_bucket_rows(df_orders, bucket_start.replace(tzinfo=None))
+        players_online = _read_players_online(redis_url)
+        warfare_isk_destroyed = _read_warfare_isk_destroyed(redis_url)
+        rows = _compute_bucket_rows(
+            df_orders,
+            bucket_start.replace(tzinfo=None),
+            players_online=players_online,
+            warfare_isk_destroyed=warfare_isk_destroyed,
+        )
         if not rows:
             logger.info(
                 "No rows to write for bucket %s (window %s -> %s)",
@@ -220,9 +276,11 @@ def write_market_history_tick(
             INSERT INTO market_history (
                 timestamp, region_id, type_id,
                 open, high, low, close, volume,
-                avg_price, max_velocity, median_spread, order_book_imbalance
+                avg_price, max_velocity, median_spread, order_book_imbalance,
+                players_online,
+                warfare_isk_destroyed
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (timestamp, region_id, type_id) DO UPDATE SET
                 open = EXCLUDED.open,
                 high = EXCLUDED.high,
@@ -232,7 +290,9 @@ def write_market_history_tick(
                 avg_price = EXCLUDED.avg_price,
                 max_velocity = EXCLUDED.max_velocity,
                 median_spread = EXCLUDED.median_spread,
-                order_book_imbalance = EXCLUDED.order_book_imbalance
+                order_book_imbalance = EXCLUDED.order_book_imbalance,
+                players_online = EXCLUDED.players_online,
+                warfare_isk_destroyed = EXCLUDED.warfare_isk_destroyed
         """
 
         with conn.cursor() as cur:
@@ -251,6 +311,11 @@ def main() -> None:
         default=os.getenv("DATABASE_URL", "postgresql://eve_user:eve_pass@db:5432/eve_market_data"),
         help="Postgres DSN (defaults to DATABASE_URL)",
     )
+    parser.add_argument(
+        "--redis-url",
+        default=os.getenv("REDIS_URL", ""),
+        help="Redis URL for macro features (defaults to REDIS_URL)",
+    )
     parser.add_argument("--region-id", type=int, default=None, help="Optional region_id filter")
     parser.add_argument("--bucket-minutes", type=int, default=5)
     parser.add_argument("--lookback-minutes", type=int, default=5)
@@ -261,6 +326,7 @@ def main() -> None:
     if not args.loop:
         write_market_history_tick(
             database_url=args.database_url,
+            redis_url=(args.redis_url or None),
             region_id=args.region_id,
             bucket_minutes=args.bucket_minutes,
             lookback_minutes=args.lookback_minutes,
@@ -268,11 +334,26 @@ def main() -> None:
         return
 
     logger.info("Starting historian loop (bucket=%dm, lookback=%dm)", args.bucket_minutes, args.lookback_minutes)
+
+    # Run once immediately so operators don't wait up to a full bucket interval
+    # before seeing market_history advance.
+    try:
+        write_market_history_tick(
+            database_url=args.database_url,
+            redis_url=(args.redis_url or None),
+            region_id=args.region_id,
+            bucket_minutes=args.bucket_minutes,
+            lookback_minutes=args.lookback_minutes,
+        )
+    except Exception as e:
+        logger.error("Historian initial tick failed: %s", e)
+
     while True:
         _sleep_until_next_bucket(args.bucket_minutes)
         try:
             write_market_history_tick(
                 database_url=args.database_url,
+                redis_url=(args.redis_url or None),
                 region_id=args.region_id,
                 bucket_minutes=args.bucket_minutes,
                 lookback_minutes=args.lookback_minutes,

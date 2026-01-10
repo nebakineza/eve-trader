@@ -4,3 +4,7 @@ pandas
 redis
 numpy
 streamlit-autorefresh
+opencv-python-headless
+pytesseract
+pyserial
+Pillow

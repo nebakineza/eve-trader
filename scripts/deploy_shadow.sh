@@ -21,6 +21,11 @@ if ! command -v docker-compose &> /dev/null; then
 fi
 echo "✅ Docker environment found."
 
+# 1.5. Clean up Artifacts
+echo "🧹 Cleaning up potentially large artifacts..."
+rm -rf .venv .venv-blackwell
+rm -f *.deb
+
 # 2. Setup Data Directories
 echo "📂 Setting up data directories..."
 mkdir -p data/postgres
@@ -70,6 +75,14 @@ if command -v docker-compose &> /dev/null; then
     docker-compose up -d --build
 else
     docker compose up -d --build
+fi
+
+# 5. Install Disk Guard
+if [ -f "scripts/install_disk_guard_systemd.sh" ]; then
+    echo "🛡️ Installing Disk Guard..."
+    sudo bash scripts/install_disk_guard_systemd.sh
+else
+    echo "⚠️ scripts/install_disk_guard_systemd.sh not found, skipping disk guard installation."
 fi
 
 echo "=========================================="

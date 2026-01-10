@@ -24,24 +24,30 @@ class AnalystFeatureFactory:
         return net_profit
 
     def order_book_imbalance(self, order_book: pd.DataFrame) -> float:
+        """
+        Compute OBI: Ratio of Buy Volume to Sell Volume at the top 5 price levels.
+        """
         if order_book.empty:
             return 0.0
+        
         bids = order_book[order_book['is_buy_order'] == True]
         asks = order_book[order_book['is_buy_order'] == False]
+        
         if bids.empty or asks.empty:
             return 0.0
-        best_bid = bids['price'].max()
-        best_ask = asks['price'].min()
-        mid_price = (best_bid + best_ask) / 2
-        buy_depth_cutoff = mid_price * 0.95
-        sell_depth_cutoff = mid_price * 1.05
-        top_bids = bids[bids['price'] >= buy_depth_cutoff]
-        top_asks = asks[asks['price'] <= sell_depth_cutoff]
-        bid_depth_isk = (top_bids['price'] * top_bids['volume_remain']).sum()
-        ask_depth_isk = (top_asks['price'] * top_asks['volume_remain']).sum()
-        if ask_depth_isk == 0:
-            return 999.0
-        return bid_depth_isk / ask_depth_isk
+            
+        # Top 5 Levels logic
+        bid_levels = bids.groupby('price')['volume_remain'].sum().sort_index(ascending=False).head(5)
+        ask_levels = asks.groupby('price')['volume_remain'].sum().sort_index(ascending=True).head(5)
+        
+        bid_vol = bid_levels.sum()
+        ask_vol = ask_levels.sum()
+        
+        if ask_vol == 0:
+            return 10.0 # Cap ratio at 10.0 to avoid Infinity
+            
+        ratio = bid_vol / ask_vol
+        return float(ratio)
 
     def normalize_rolling_z_score(self, df: pd.DataFrame, window: int = 24) -> pd.DataFrame:
         return df

@@ -3,31 +3,18 @@
 # Headless "Zombie" Bridge Setup for Debian Host (192.168.14.105)
 # Target Hardware: NVIDIA P4000
 
-set -e
-
-echo "[*] Initiating Zombie Node Setup..."
-
-# 1. GPU Drivers & Prereqs
-echo "[*] checking NVIDIA drivers..."
-if ! command -v nvidia-smi &> /dev/null; then
-    echo "[!] NVIDIA driver not found. Installing..."
-    # Ensure non-free repositories are available in /etc/apt/sources.list before running this in production
-    sudo apt-get update
-    sudo apt-get install -y nvidia-driver firmware-misc-nonfree
-else
-    echo "[ok] NVIDIA driver detected."
-    nvidia-smi
-fi
+echo "[zombie_init] Direct injection removed from software; automation is disabled." >&2
+echo "[zombie_init] This script is intentionally disabled." >&2
+exit 2
 
 # 2. Minimal X11 Container
 echo "[*] Installing Headless X11 Stack..."
 missing_pkgs=()
-for cmd in Xvfb openbox xdotool python3; do
+for cmd in Xvfb openbox python3; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         case "$cmd" in
             Xvfb) missing_pkgs+=(xvfb xserver-xorg-core) ;;
             openbox) missing_pkgs+=(openbox) ;;
-            xdotool) missing_pkgs+=(xdotool) ;;
             python3) missing_pkgs+=(python3 python3-pip) ;;
         esac
     fi
@@ -73,9 +60,23 @@ EVE_TARGET_EXE="$EVE_EXE"
 if [ -f "$EVE_LAUNCHER_EXE" ]; then
     EVE_TARGET_EXE="$EVE_LAUNCHER_EXE"
 fi
+# Force direct launch for stability
+# export EVE_TARGET_EXE="$EVE_EXE"
 
 # Keep the Wine prefix inside the drop-zone so potatofy can watch it directly.
 export WINEPREFIX="${ZOMBIE_WINEPREFIX:-$EVE_DROPZONE/wineprefix}"
+
+# Fix White Rectangle Occlusion: prefer desktop OpenGL and a managed Wine virtual desktop.
+export QT_OPENGL=desktop
+
+# Software Rendering Fallback (Forced by User Request)
+export LIBGL_ALWAYS_SOFTWARE=1
+export QT_QUICK_BACKEND=software
+export QT_OPENGL=software
+export ZOMBIE_SOFTWARE_RENDER=1
+export ZOMBIE_WINE_DESKTOP_NAME="EVE"
+export ZOMBIE_WINE_DESKTOP_RES="1920x1080"
+export ZOMBIE_RESET_X=1
 
 # Start the Potato Guardian early so it can hijack settings immediately when the prefix/settings tree is generated.
 POTATOFY_SCRIPT="${POTATOFY_SCRIPT:-$HOME/eve-trader/scripts/potatofy.py}"
@@ -96,11 +97,23 @@ else
 fi
 
 # 4. Virtual Display Launch (only if needed)
+if [ "${ZOMBIE_RESET_X:-0}" = "1" ]; then
+    echo "[*] Forcing X reset on $DISPLAY (ZOMBIE_RESET_X=1)..."
+    pids="$(pgrep -f "Xvfb $DISPLAY" 2>/dev/null || true)"
+    if [ -n "$pids" ]; then
+        kill -9 $pids 2>/dev/null || true
+    fi
+    lock_num="${DISPLAY#:}"
+    rm -f "/tmp/.X${lock_num}-lock" 2>/dev/null || true
+fi
+
 if command -v xdpyinfo >/dev/null 2>&1 && xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
     echo "[ok] X display $DISPLAY is available."
 else
     echo "[*] X display $DISPLAY not available; launching Xvfb..."
-    Xvfb "$DISPLAY" -screen 0 1920x1080x24 &
+    # User requested deep reset params: 24-bit depth + 32 padding, GLX, RENDER, noreset
+    XVFB_SCREEN="${ZOMBIE_XVFB_SCREEN:-1920x1080x24+32}"
+    Xvfb "$DISPLAY" -screen 0 "$XVFB_SCREEN" -extension GLX +extension RENDER -noreset &
     sleep 2
 fi
 
@@ -188,8 +201,14 @@ if [ -n "$WINE_BIN" ]; then
     if [ -f /tmp/eve_exefile.pid ] && ps -p "$(cat /tmp/eve_exefile.pid 2>/dev/null)" >/dev/null 2>&1; then
         echo "[ok] EVE already running (pid=$(cat /tmp/eve_exefile.pid))"
     else
-        echo "[*] Launching via $WINE_BIN (WINEPREFIX=$WINEPREFIX): $EVE_TARGET_EXE"
-        nohup "$WINE_BIN" "$EVE_TARGET_EXE" > /tmp/eve_exefile.log 2>&1 &
+        LAUNCH_ARGS=()
+        if [ "${ZOMBIE_SOFTWARE_RENDER:-0}" = "1" ]; then
+            LAUNCH_ARGS+=(--disable-gpu --disable-gpu-compositing)
+        fi
+
+        echo "[*] Launching via managed Wine desktop ($ZOMBIE_WINE_DESKTOP_NAME,$ZOMBIE_WINE_DESKTOP_RES)"
+        echo "[*] Command: $WINE_BIN explorer /desktop=$ZOMBIE_WINE_DESKTOP_NAME,$ZOMBIE_WINE_DESKTOP_RES $EVE_TARGET_EXE ${LAUNCH_ARGS[*]}"
+        nohup "$WINE_BIN" explorer "/desktop=${ZOMBIE_WINE_DESKTOP_NAME},${ZOMBIE_WINE_DESKTOP_RES}" "$EVE_TARGET_EXE" "${LAUNCH_ARGS[@]}" > /tmp/eve_exefile.log 2>&1 &
         echo $! > /tmp/eve_exefile.pid
         echo "[ok] EVE launched pid=$(cat /tmp/eve_exefile.pid) (log: /tmp/eve_exefile.log)"
     fi
@@ -198,35 +217,9 @@ else
     echo "Install and run: wine \"$EVE_EXE\""
 fi
 
+
 # 7. 3D Kill-Switch Daemon
-# Waits for EVE window, disables audio/effects during boot, then sends Ctrl+Shift+F9
-# after the user has entered station.
-(
-    echo "[*] Waiting for EVE Client to appear..."
-    # Loop until window found (adjust window name 'EVE' as needed)
-    while true; do
-        EVE_WIN_ID="$(xdotool search --name "EVE - " 2>/dev/null | head -n 1 || true)"
-        if [ -n "$EVE_WIN_ID" ]; then
-            echo "[*] EVE Client detected (window id: $EVE_WIN_ID)."
-
-            echo "[*] Disabling audio (Ctrl+Alt+Shift+F12)"
-            xdotool windowactivate --sync "$EVE_WIN_ID" key --delay 100 ctrl+alt+shift+F12
-
-            echo "[*] Disabling effects (Ctrl+Alt+Shift+E)"
-            xdotool windowactivate --sync "$EVE_WIN_ID" key --delay 100 ctrl+alt+shift+e
-
-            ZOMBIE_ENTER_STATION_DELAY="${ZOMBIE_ENTER_STATION_DELAY:-180}"
-            echo "[*] Waiting ${ZOMBIE_ENTER_STATION_DELAY}s to allow 'Enter Station'..."
-            sleep "$ZOMBIE_ENTER_STATION_DELAY"
-
-            echo "[*] Sending 2D toggle (Ctrl+Shift+F9)"
-            xdotool windowactivate --sync "$EVE_WIN_ID" key --delay 100 ctrl+shift+F9
-            echo "[ok] P4000 switched to 2D Compute Mode."
-            break
-        fi
-        sleep 5
-    done
-) &
+# Disabled: direct input injection removed from software.
 
 # 8. Identity Phase Automation
 # - If launcher is open but client isn't running, nudge the "Play" trigger periodically.
@@ -242,7 +235,7 @@ ZOMBIE_EULA_BRIDGE_SCRIPT="${ZOMBIE_EULA_BRIDGE_SCRIPT:-$HOME/eve-trader/scripts
 ZOMBIE_LAUNCHER_POLL_SECONDS="${ZOMBIE_LAUNCHER_POLL_SECONDS:-60}"
 ZOMBIE_CREDS_POLL_SECONDS="${ZOMBIE_CREDS_POLL_SECONDS:-5}"
 
-ZOMBIE_CLIENT_PROC_PATTERN="${ZOMBIE_CLIENT_PROC_PATTERN:-exefile.exe|eve-online.exe}"
+ZOMBIE_CLIENT_PROC_PATTERN="${ZOMBIE_CLIENT_PROC_PATTERN:-exefile.exe}"
 ZOMBIE_LAUNCHER_WINDOW_PATTERN="${ZOMBIE_LAUNCHER_WINDOW_PATTERN:-EVE Launcher}"
 ZOMBIE_LOGIN_WINDOW_PATTERN="${ZOMBIE_LOGIN_WINDOW_PATTERN:-EVE - |EVE Online|Login}"
 ZOMBIE_CHARSEL_WINDOW_PATTERN="${ZOMBIE_CHARSEL_WINDOW_PATTERN:-Character Selection|Select Character}"
@@ -250,7 +243,9 @@ ZOMBIE_OTP_BRIDGE="${ZOMBIE_OTP_BRIDGE:-1}"
 ZOMBIE_EULA_BRIDGE="${ZOMBIE_EULA_BRIDGE:-1}"
 ZOMBIE_EULA_REDIS_KEY="${ZOMBIE_EULA_REDIS_KEY:-system:zombie:eula_accept}"
 
-if [ -f "$LAUNCHER_CONTROL_SCRIPT" ] && [ "$EVE_TARGET_EXE" != "$EVE_EXE" ]; then
+if [ "${ZOMBIE_DISABLE_LAUNCHER_CONTROL:-0}" = "1" ]; then
+    echo "[ok] launcher_control disabled (ZOMBIE_DISABLE_LAUNCHER_CONTROL=1)."
+elif [ -f "$LAUNCHER_CONTROL_SCRIPT" ] && [ "$EVE_TARGET_EXE" != "$EVE_EXE" ]; then
     if [ -f /tmp/launcher_control.pid ] && ps -p "$(cat /tmp/launcher_control.pid 2>/dev/null)" >/dev/null 2>&1; then
         echo "[ok] launcher_control already running (pid=$(cat /tmp/launcher_control.pid))"
     else
@@ -318,18 +313,7 @@ else
         echo "[!] EULA bridge disabled or script missing; skipping."
 fi
 
-(
-    echo "[*] Waiting for Character Selection to appear..."
-    while true; do
-        CHARSEL_WIN_ID="$(xdotool search --name "$ZOMBIE_CHARSEL_WINDOW_PATTERN" 2>/dev/null | head -n 1 || true)"
-        if [ -n "$CHARSEL_WIN_ID" ]; then
-            echo "[*] Character Selection detected (window id: $CHARSEL_WIN_ID). Entering world (Return)..."
-            xdotool windowactivate --sync "$CHARSEL_WIN_ID" key --delay 100 Return
-            echo "[ok] Enter-world handshake sent."
-            break
-        fi
-        sleep 5
-    done
-) &
+
+# Character selection automation disabled: direct input injection removed from software.
 
 echo "[ok] Zombie Node Initialized. Display $DISPLAY active."
