@@ -632,8 +632,8 @@ async def main():
             import traceback
             traceback.print_exc()
         
-        logger.info("Cycle complete. Sleeping 60s...")
-        await asyncio.sleep(60)
+        logger.info("Cycle complete. Sleeping 10s (Governor Throttled)...")
+        await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main())

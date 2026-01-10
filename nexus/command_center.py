@@ -793,6 +793,66 @@ with tab_execution:
 with tab_oracle:
     st.markdown("### 🧠 Oracle Insight")
 
+    # --- New Diagnostic Injection: Inference Narrative ---
+    st.markdown("#### 👁️ Oracle Vision (Inference Narrative)")
+    
+    # 1. Real-time Parameters (Kelly & Confidence)
+    conf_thresh = float(os.getenv("SHADOW_CONFIDENCE_THRESHOLD", "0.60"))
+    # Kelly: Try to get from last signal or config. 
+    # For now, we simulate/calculate based on standard config references if not in Redis.
+    # In minimalist mode, we show the static config or recent signal snapshot.
+    kelly_frac = 0.05 # Default cap
+    try:
+        last_sig_raw = r.get("oracle:last_signal_snapshot")
+        if last_sig_raw:
+            d = json.loads(last_sig_raw)
+            kelly_frac = float(d.get("kelly", 0.05))
+    except:
+        pass
+    
+    c_d1, c_d2, c_d3 = st.columns(3)
+    c_d1.metric("Active Confidence Threshold", f"{conf_thresh:.2f}")
+    c_d2.metric("Kelly Fraction (Dynamic)", f"{kelly_frac:.4f}")
+    
+    # 2. Optimization History (Induction Loss Sparkline)
+    curr_loss_hist = []
+    try:
+        # oracle:training_lineage is a list of JSON strings
+        lineage = r.lrange("oracle:training_lineage", 0, 9) # Last 10
+        if lineage:
+            for run_str in reversed(lineage): # Oldest to newest
+                run_data = json.loads(run_str)
+                # Try 'final_loss' or 'val_loss' or 'best_val_loss'
+                # fallback to 0
+                val = run_data.get("best_val_loss") or run_data.get("loss") or 0.0
+                curr_loss_hist.append(float(val))
+    except:
+        pass
+    
+    if curr_loss_hist:
+        c_d3.caption("Induction Loss Trend (Last 10)")
+        c_d3.line_chart(curr_loss_hist, height=80) 
+    else:
+        c_d3.info("No Training History")
+
+    # 3. Weight Deviations (Attention)
+    # Parse oracle:feature_importance
+    try:
+        fi_raw = r.get("oracle:feature_importance")
+        if fi_raw:
+            fi = json.loads(fi_raw)
+            # Sort by absolute value desc
+            sorted_fi = sorted(fi.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+            
+            top_text = [f"**{k}** ({v:.3f})" for k,v in sorted_fi]
+            st.info(f"🔥 **High Attention Features:** {', '.join(top_text)}")
+        else:
+            st.info("Waiting for Feature Importance Analysis...")
+    except:
+        pass
+
+    st.divider()
+
     # Model Path & Validation R²
     model_path_used = "models/oracle_v1_latest.pt"  # default / fallback
     if r:
@@ -2131,6 +2191,30 @@ with tab_performance:
 # ========================
 with tab_system:
     st.markdown("### 🛡️ System Logs & Telemetry")
+    
+    # [Added] Behavioral Governor (Remote Proof)
+    st.markdown("#### 🚦 Behavioral Governor (Active Config)")
+    gov_start = int(os.getenv("GOV_SCHEDULE_START_HOUR", "8"))
+    gov_end = int(os.getenv("GOV_SCHEDULE_END_HOUR", "23"))
+    gov_cap_min = int(os.getenv("GOV_ORDER_CAP_MIN", "35"))
+    gov_cap_max = int(os.getenv("GOV_ORDER_CAP_MAX", "50"))
+    
+    # Check current status
+    gov_status = "ACTIVE"
+    now_g = datetime.now(timezone.utc)
+    if not (gov_start <= now_g.hour < gov_end):
+        gov_status = "SLEEPING (Schedule)"
+    
+    # Check fatigue break
+    if r:
+        if r.get("system:governor:on_break_until"):
+            gov_status = "FATIGUE BREAK (15m)"
+            
+    c_g1, c_g2, c_g3 = st.columns(3)
+    c_g1.metric("Schedule (UTC)", f"{gov_start:02d}:00 - {gov_end:02d}:00")
+    c_g2.metric("Order Cap/Hr", f"{gov_cap_min}-{gov_cap_max}")
+    c_g3.metric("Current State", gov_status)
+    st.divider()
     
     # [Added] Stop-Loss Sensitivity Slider
     sl_val = 1.5
