@@ -47,3 +47,5 @@ config.json
 # Local virtualenv variants
 .venv-*/
 .venv-*
+.venv_*/
+.venv_*
