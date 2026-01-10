@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
@@ -146,15 +147,22 @@ def _wayland_env_for_current_user() -> dict[str, str] | None:
     if not os.path.isdir(xdg_runtime):
         return None
 
+    def _is_wayland_socket(path: str) -> bool:
+        try:
+            st = os.stat(path)
+            return stat.S_ISSOCK(st.st_mode)
+        except Exception:
+            return False
+
     # Prefer wayland-0, else any wayland-* socket.
     preferred = os.path.join(xdg_runtime, "wayland-0")
     wayland_display = None
-    if os.path.exists(preferred):
+    if _is_wayland_socket(preferred):
         wayland_display = "wayland-0"
     else:
         try:
             for name in os.listdir(xdg_runtime):
-                if name.startswith("wayland-") and os.path.exists(os.path.join(xdg_runtime, name)):
+                if name.startswith("wayland-") and _is_wayland_socket(os.path.join(xdg_runtime, name)):
                     wayland_display = name
                     break
         except Exception:
@@ -186,11 +194,10 @@ def _capture_x11(*, display: str, png_path: str) -> None:
     subprocess.run([scrot, "-o", png_path], env=env, check=True)
 
 
-def _capture_wayland(*, png_path: str) -> None:
+def _capture_wayland(*, png_path: str, wl_env: dict[str, str] | None = None) -> None:
     grim = _require_tool("grim")
 
     env = os.environ.copy()
-    wl_env = _wayland_env_for_current_user()
     if not wl_env:
         raise RuntimeError("No Wayland runtime detected (missing XDG_RUNTIME_DIR/wayland-* socket)")
     env.update(wl_env)
@@ -333,13 +340,14 @@ def capture_once(
     # - Only attempt Wayland capture when a Wayland runtime is present (wayland-* socket).
     # - Prefer Wayland when available (best signal for a real desktop session), but always
     #   fall back to X11.
-    wayland_available = _wayland_env_for_current_user() is not None
+    wl_env = _wayland_env_for_current_user()
+    wayland_available = wl_env is not None
     prefer_wayland = os.getenv("ZOMBIE_SHOT_PREFER_WAYLAND", "1").strip().lower() in {"1", "true", "yes"}
     prefer_wayland_first = wayland_available and (prefer_wayland or str(display).strip() == ":0")
 
     if prefer_wayland_first:
         try:
-            _capture_wayland(png_path=png_path)
+            _capture_wayland(png_path=png_path, wl_env=wl_env)
             _convert_png_to_jpg(png_path=png_path, jpg_path=jpg_path, jpg_quality=jpg_quality)
             raw = open(jpg_path, "rb").read()
             if min_jpg_bytes > 0 and len(raw) < int(min_jpg_bytes):
@@ -369,7 +377,7 @@ def capture_once(
     # (only if Wayland runtime is actually available).
     if captured_via is None and not prefer_wayland_first and wayland_available:
         try:
-            _capture_wayland(png_path=png_path)
+            _capture_wayland(png_path=png_path, wl_env=wl_env)
             _convert_png_to_jpg(png_path=png_path, jpg_path=jpg_path, jpg_quality=jpg_quality)
             raw = open(jpg_path, "rb").read()
             if min_jpg_bytes > 0 and len(raw) < int(min_jpg_bytes):
