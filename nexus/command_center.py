@@ -2043,13 +2043,15 @@ with tab_system:
 
         # SkyNet / 5090 metrics (training host)
         s_temp = "N/A"
-        s_load = "0%"
-        s_vram = "0 MiB"
+        s_load = "N/A"
+        s_vram = "N/A"
+        s_last_seen = None
         if r:
             try:
                 t = sticky_get("system:skynet:temp", r)
                 u = sticky_get("system:skynet:load", r)
                 m = sticky_get("system:skynet:vram", r)
+                s_last_seen = sticky_get("system:skynet:last_seen", r)
                 if t is not None:
                     s_temp = f"{t}°C"
                 if u is not None:
@@ -2063,6 +2065,13 @@ with tab_system:
         c4.metric("5090 Temp", s_temp)
         c5.metric("5090 Load", s_load)
         c6.metric("5090 VRAM", s_vram)
+
+        if s_last_seen:
+            try:
+                age_s = max(0, int(time.time() - float(s_last_seen)))
+                st.caption(f"5090 telemetry last seen: {age_s}s ago")
+            except Exception:
+                pass
         
         # render_eve_client_sync_status() REMOVED
         
@@ -2194,7 +2203,8 @@ with tab_system:
             
     st.divider()
     st.markdown("### 🧟 Zombie Monitor Console (launcher_stdout.log)")
-    log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "launcher_stdout.log")
+    default_log_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "launcher_stdout.log")
+    log_path = os.getenv("LAUNCHER_STDOUT_LOG_PATH", default_log_path)
     
     if os.path.exists(log_path):
         try:
@@ -2203,13 +2213,18 @@ with tab_system:
                 f.seek(0, os.SEEK_END)
                 size = f.tell()
                 read_size = min(size, 10000)
-                f.seek(size - read_size)
-                content = f.read()
-                st.code(content, language="text")
+                if read_size > 0:
+                    f.seek(size - read_size)
+                    content = f.read()
+                    st.code(content, language="text")
+                else:
+                    st.info(f"Log file is empty: {log_path}")
         except Exception as e:
             st.error(f"Error reading logs: {e}")
     else:
-        st.warning(f"Log file not found: {log_path}")
+        st.info(
+            f"Log file not found: {log_path}. If you run launcher control outside Docker, redirect stdout/stderr to this path (or set LAUNCHER_STDOUT_LOG_PATH)."
+        )
 
     st.divider()
     st.header("Global Debug Stream")

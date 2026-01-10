@@ -60,19 +60,20 @@ def tile_oracle_logs() -> str:
 def main() -> None:
     interval_s = int(os.getenv("GPU_LOGGER_INTERVAL_SECONDS", "5"))
     prefix = os.getenv("GPU_METRIC_PREFIX", "system:p4000")
+    publish_oracle_logs = os.getenv("PUBLISH_ORACLE_LOGS", "1").strip().lower() in {"1", "true", "yes"}
     r = _redis_client()
 
     logger.info(f"GPU telemetry logger started for {prefix} (interval={interval_s}s)")
 
     while True:
-        # SkyNet Telemetry: Oracle Logs (Priority)
-        if "skynet" in prefix:
-             try:
-                 logs = tile_oracle_logs()
-                 if logs:
-                     r.set("system:oracle:logs", logs)
-             except Exception as e:
-                 logger.warning("Failed to tile oracle logs: %s", e)
+        # Oracle logs (best effort; used by dashboard System tab)
+        if publish_oracle_logs:
+            try:
+                logs = tile_oracle_logs()
+                if logs:
+                    r.set("system:oracle:logs", logs)
+            except Exception as e:
+                logger.warning("Failed to tile oracle logs: %s", e)
 
         # GPU Metrics (Best Effort)
         try:

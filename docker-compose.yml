@@ -122,7 +122,7 @@ services:
       args:
         REQUIREMENTS_FILE: requirements.oracle.txt
     container_name: eve-trader-oracle
-    command: uvicorn oracle.main:app --host 0.0.0.0 --port 8000
+    command: /bin/sh -c "uvicorn oracle.main:app --host 0.0.0.0 --port 8000 2>&1 | tee -a /app/logs/oracle_uvicorn.log"
     depends_on:
       - cache
     environment:
@@ -309,7 +309,8 @@ services:
     environment:
       - REDIS_URL=redis://cache:6379/0
       - GPU_LOGGER_INTERVAL_SECONDS=30
-      - GPU_METRIC_PREFIX=system:skynet
+      - GPU_METRIC_PREFIX=${GPU_METRIC_PREFIX:-system:p4000}
+      - PUBLISH_ORACLE_LOGS=${PUBLISH_ORACLE_LOGS:-1}
     volumes:
       - ./:/app
     networks:
